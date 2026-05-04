@@ -7,6 +7,7 @@ Conçu pour tourner en continu (H24).
 
 import os
 import sys
+import json
 import shutil
 import threading
 import time
@@ -27,7 +28,79 @@ from watchdog.events import FileSystemEventHandler
 
 ARCHIVE_FOLDER_NAME = "_Archive"  # Dossier où sont déplacés les fichiers supprimés
 LOG_FILE_NAME = "SimpleClone_Errors.log"
-POLLING_INTERVAL = 2  # Intervalle de vérification en secondes (polling)
+DEFAULT_POLLING_INTERVAL = 2  # Intervalle de vérification en secondes (polling)
+
+
+# =============================================================================
+# GESTION DE LA CONFIGURATION UTILISATEUR (JSON dans %APPDATA%)
+# =============================================================================
+
+class ConfigManager:
+    """
+    Charge et sauvegarde la config persistante de l'utilisateur.
+    Sur Windows : %APPDATA%\\SimpleClone\\config.json
+    Sur Linux/Mac (dev) : ~/.config/SimpleClone/config.json
+    Aucune erreur de lecture/écriture ne doit faire crasher l'app : si la config
+    est absente ou corrompue, on retombe sur les valeurs par défaut.
+    """
+
+    DEFAULTS = {
+        "source_path": "",
+        "dest_path": "",
+        "autostart_windows": False,
+        "autostart_surveillance": False,
+        "polling_interval": DEFAULT_POLLING_INTERVAL,
+        "start_minimized": False,
+    }
+
+    def __init__(self):
+        self.config_dir = self._get_config_dir()
+        self.config_file = self.config_dir / "config.json"
+        self.data = dict(self.DEFAULTS)
+
+    @staticmethod
+    def _get_config_dir():
+        if sys.platform == "win32":
+            base = os.environ.get("APPDATA")
+            if base:
+                return Path(base) / "SimpleClone"
+        # Fallback Linux/Mac (utile pour dev en WSL)
+        return Path.home() / ".config" / "SimpleClone"
+
+    def load(self):
+        """Charge la config depuis le disque. Silencieux en cas d'erreur."""
+        try:
+            if self.config_file.exists():
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                # Merge avec defaults : les clés inconnues sont ignorées,
+                # les clés manquantes prennent leur valeur par défaut.
+                for key in self.DEFAULTS:
+                    if key in loaded:
+                        self.data[key] = loaded[key]
+        except Exception:
+            pass  # Config corrompue ou illisible : on garde les defaults
+        return self.data
+
+    def save(self):
+        """Sauvegarde atomique (write-then-rename) pour éviter la corruption."""
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.config_file.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+            tmp.replace(self.config_file)
+        except Exception:
+            pass  # Échec d'écriture : pas critique, on retentera au prochain change
+
+    def set(self, key, value):
+        """Met à jour une clé et sauvegarde immédiatement."""
+        if key in self.DEFAULTS:
+            self.data[key] = value
+            self.save()
+
+    def get(self, key):
+        return self.data.get(key, self.DEFAULTS.get(key))
 
 
 # =============================================================================
@@ -279,9 +352,13 @@ class SimpleCloneApp:
         self.root.geometry("700x500")
         self.root.minsize(600, 400)
 
-        # Variables
-        self.source_var = tk.StringVar()
-        self.dest_var = tk.StringVar()
+        # Config persistante (chargée avant la création des widgets pour pré-remplir)
+        self.config = ConfigManager()
+        self.config.load()
+
+        # Variables — initialisées avec les valeurs de la config si disponibles
+        self.source_var = tk.StringVar(value=self.config.get("source_path"))
+        self.dest_var = tk.StringVar(value=self.config.get("dest_path"))
         self.status_var = tk.StringVar(value="Prêt - Sélectionnez les dossiers")
         self.observer = None
         self.is_running = False
@@ -384,6 +461,7 @@ class SimpleCloneApp:
         folder = filedialog.askdirectory(title="Sélectionner le dossier source")
         if folder:
             self.source_var.set(folder)
+            self.config.set("source_path", folder)
             self._log(f"📂 Source sélectionnée: {folder}", "info")
 
     def _browse_dest(self):
@@ -391,6 +469,7 @@ class SimpleCloneApp:
         folder = filedialog.askdirectory(title="Sélectionner le dossier destination")
         if folder:
             self.dest_var.set(folder)
+            self.config.set("dest_path", folder)
             self._log(f"📂 Destination sélectionnée: {folder}", "info")
 
     def _log(self, message, tag="info"):
@@ -490,12 +569,13 @@ class SimpleCloneApp:
 
         # Démarre la surveillance continue avec watchdog
         # PollingObserver vérifie les changements toutes les X secondes (plus fiable sur Windows/USB)
-        self.observer = PollingObserver(timeout=POLLING_INTERVAL)
+        polling_interval = self.config.get("polling_interval") or DEFAULT_POLLING_INTERVAL
+        self.observer = PollingObserver(timeout=polling_interval)
         self.observer.schedule(handler, source, recursive=True)
         self.observer.start()
 
         self.root.after(0, lambda: self._log(
-            f"🔄 Mode polling actif (vérification toutes les {POLLING_INTERVAL}s)", "info"
+            f"🔄 Mode polling actif (vérification toutes les {polling_interval}s)", "info"
         ))
 
         self._update_status("Surveillance active")
