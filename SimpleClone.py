@@ -104,6 +104,77 @@ class ConfigManager:
 
 
 # =============================================================================
+# DÉMARRAGE AUTOMATIQUE AVEC WINDOWS (registre HKCU\...\Run)
+# =============================================================================
+#
+# On utilise HKCU plutôt que HKLM (pas besoin de droits admin) et le registre
+# plutôt que le dossier Startup (plus propre, plus discret).
+# Sur les autres OS, ces fonctions sont des no-op : permet de tester l'UI sous
+# WSL/Linux sans crash.
+
+AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_REG_NAME = "SimpleClone"
+
+
+def _get_autostart_command():
+    """
+    Construit la commande à enregistrer dans le registre.
+    En mode frozen (PyInstaller) : on lance directement l'exe.
+    En mode dev : on lance pythonw.exe + le script (sans console noire).
+    Le flag --minimized indique à l'app de démarrer cachée dans la zone de
+    notification (logique gérée par le system tray, étape 5).
+    """
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --minimized'
+    script = Path(__file__).resolve()
+    # En dev, on tente pythonw.exe (pas de console) sinon on retombe sur python
+    exe = sys.executable
+    if sys.platform == "win32":
+        candidate = Path(exe).with_name("pythonw.exe")
+        if candidate.exists():
+            exe = str(candidate)
+    return f'"{exe}" "{script}" --minimized'
+
+
+def set_windows_autostart(enabled):
+    """Active/désactive le démarrage avec Windows. Retourne True si succès."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            if enabled:
+                winreg.SetValueEx(
+                    key, AUTOSTART_REG_NAME, 0, winreg.REG_SZ, _get_autostart_command()
+                )
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_REG_NAME)
+                except FileNotFoundError:
+                    pass  # Clé déjà absente, idempotent
+        return True
+    except Exception:
+        return False
+
+
+def is_windows_autostart_enabled():
+    """Vérifie si la clé est présente dans le registre (source de vérité)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY, 0, winreg.KEY_READ
+        ) as key:
+            winreg.QueryValueEx(key, AUTOSTART_REG_NAME)
+        return True
+    except Exception:
+        return False
+
+
+# =============================================================================
 # GESTIONNAIRE D'ÉVÉNEMENTS FICHIERS
 # =============================================================================
 
@@ -346,19 +417,34 @@ def initial_sync(source_path, dest_path, handler, progress_callback, log_callbac
 class SimpleCloneApp:
     """Application principale avec interface Tkinter."""
 
-    def __init__(self, root):
+    def __init__(self, root, args=None):
         self.root = root
         self.root.title("SimpleClone")
         self.root.geometry("700x500")
         self.root.minsize(600, 400)
 
+        # Args CLI (ex: --minimized lors d'un démarrage automatique Windows)
+        self.args = args
+
         # Config persistante (chargée avant la création des widgets pour pré-remplir)
         self.config = ConfigManager()
         self.config.load()
 
+        # Synchronise l'état "autostart Windows" de la config avec le registre :
+        # le registre est la source de vérité (l'utilisateur peut l'avoir modifié
+        # à la main, ou la dernière session a pu se terminer mal).
+        if sys.platform == "win32":
+            actual_autostart = is_windows_autostart_enabled()
+            if actual_autostart != self.config.get("autostart_windows"):
+                self.config.set("autostart_windows", actual_autostart)
+
         # Variables — initialisées avec les valeurs de la config si disponibles
         self.source_var = tk.StringVar(value=self.config.get("source_path"))
         self.dest_var = tk.StringVar(value=self.config.get("dest_path"))
+        self.autostart_windows_var = tk.BooleanVar(value=self.config.get("autostart_windows"))
+        self.autostart_surveillance_var = tk.BooleanVar(
+            value=self.config.get("autostart_surveillance")
+        )
         self.status_var = tk.StringVar(value="Prêt - Sélectionnez les dossiers")
         self.observer = None
         self.is_running = False
@@ -370,6 +456,23 @@ class SimpleCloneApp:
 
         # Gestion de la fermeture
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # Démarrage automatique de la surveillance si demandé ET chemins valides.
+        # Délai 500ms pour laisser l'UI s'afficher avant de lancer le thread de sync.
+        if self._should_autostart_surveillance():
+            self.root.after(500, self._start_surveillance)
+
+    def _should_autostart_surveillance(self):
+        """Détermine si on doit lancer la surveillance automatiquement au boot."""
+        if not self.config.get("autostart_surveillance"):
+            return False
+        source = self.source_var.get()
+        dest = self.dest_var.get()
+        if not source or not dest:
+            return False
+        if not os.path.isdir(source):
+            return False
+        return True
 
     def _create_widgets(self):
         """Crée tous les widgets de l'interface."""
@@ -395,6 +498,30 @@ class SimpleCloneApp:
         self.dest_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
 
         ttk.Button(dest_frame, text="Parcourir...", command=self._browse_dest).pack(side=tk.RIGHT)
+
+        # === OPTIONS DE DÉMARRAGE ===
+        options_frame = ttk.Frame(main_frame)
+        options_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.cb_autostart_windows = ttk.Checkbutton(
+            options_frame,
+            text="Démarrer avec Windows",
+            variable=self.autostart_windows_var,
+            command=self._on_autostart_windows_toggle,
+        )
+        self.cb_autostart_windows.pack(side=tk.LEFT, padx=(0, 20))
+
+        # Hors Windows : on grise la checkbox (utile pour dev en WSL)
+        if sys.platform != "win32":
+            self.cb_autostart_windows.configure(state="disabled")
+
+        self.cb_autostart_surveillance = ttk.Checkbutton(
+            options_frame,
+            text="Lancer la surveillance automatiquement",
+            variable=self.autostart_surveillance_var,
+            command=self._on_autostart_surveillance_toggle,
+        )
+        self.cb_autostart_surveillance.pack(side=tk.LEFT)
 
         # === BOUTON PRINCIPAL ===
         self.start_button = tk.Button(
@@ -471,6 +598,34 @@ class SimpleCloneApp:
             self.dest_var.set(folder)
             self.config.set("dest_path", folder)
             self._log(f"📂 Destination sélectionnée: {folder}", "info")
+
+    def _on_autostart_windows_toggle(self):
+        """Active/désactive le démarrage avec Windows (registre HKCU)."""
+        enabled = self.autostart_windows_var.get()
+        success = set_windows_autostart(enabled)
+        if not success:
+            # Échec : on remet la checkbox dans son ancien état et on prévient
+            self.autostart_windows_var.set(not enabled)
+            messagebox.showerror(
+                "Erreur",
+                "Impossible de modifier le démarrage automatique.\n"
+                "Vérifiez que vous êtes bien sur Windows."
+            )
+            return
+        self.config.set("autostart_windows", enabled)
+        self._log(
+            f"🪟 Démarrage avec Windows : {'activé' if enabled else 'désactivé'}",
+            "info"
+        )
+
+    def _on_autostart_surveillance_toggle(self):
+        """Mémorise le choix : démarrer la surveillance dès l'ouverture de l'app."""
+        enabled = self.autostart_surveillance_var.get()
+        self.config.set("autostart_surveillance", enabled)
+        self._log(
+            f"⚙ Surveillance auto au démarrage : {'activée' if enabled else 'désactivée'}",
+            "info"
+        )
 
     def _log(self, message, tag="info"):
         """Ajoute un message dans la zone de log."""
@@ -616,7 +771,22 @@ class SimpleCloneApp:
 # POINT D'ENTRÉE
 # =============================================================================
 
+def _parse_args():
+    """Parse les arguments CLI. --minimized est passé par l'autostart Windows."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="SimpleClone - Synchronisation unidirectionnelle de dossiers"
+    )
+    parser.add_argument(
+        "--minimized",
+        action="store_true",
+        help="Démarre l'application dans la zone de notification (pas de fenêtre)."
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = _parse_args()
     root = tk.Tk()
-    app = SimpleCloneApp(root)
+    app = SimpleCloneApp(root, args=args)
     root.mainloop()
