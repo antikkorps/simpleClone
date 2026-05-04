@@ -11,6 +11,8 @@ import json
 import shutil
 import threading
 import time
+import logging
+import logging.handlers
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -39,8 +41,12 @@ except ImportError:
 
 ARCHIVE_FOLDER_NAME = "_Archive"  # Dossier où sont déplacés les fichiers supprimés
 LOG_FILE_NAME = "SimpleClone_Errors.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 Mo par fichier de log avant rotation
+LOG_BACKUP_COUNT = 3              # Nombre d'anciennes versions conservées
 DEFAULT_POLLING_INTERVAL = 2  # Intervalle de vérification en secondes (polling)
 DEST_RETRY_INTERVAL = 5  # Délai entre deux tentatives de reconnexion de la destination
+MAX_LOG_LINES_UI = 1000  # Limite de lignes dans le journal de l'UI (évite la fuite mémoire en H24)
+LOG_TRIM_BATCH = 100     # Nombre de lignes supprimées d'un coup quand la limite est atteinte
 
 # États de la surveillance
 STATE_STOPPED = "stopped"
@@ -59,6 +65,47 @@ def _make_tray_icon_image(color_hex):
     draw = ImageDraw.Draw(img)
     draw.ellipse((6, 6, 58, 58), fill=color_hex, outline="#222222", width=2)
     return img
+
+
+# =============================================================================
+# LOGGER D'ERREURS (rotation automatique des fichiers .log)
+# =============================================================================
+
+def _get_log_path():
+    """Chemin du fichier de log : à côté de l'exe en mode frozen, sinon du script."""
+    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+    return base / LOG_FILE_NAME
+
+
+def _setup_error_logger():
+    """
+    Configure un logger avec rotation automatique : SimpleClone_Errors.log,
+    .log.1, .log.2, .log.3 max. Ça évite que le fichier grossisse sans limite
+    quand l'app tourne H24 sur le site client.
+    """
+    logger = logging.getLogger("simpleclone")
+    logger.setLevel(logging.ERROR)
+    # Idempotent : ne pas ré-attacher de handlers si déjà configuré
+    if not logger.handlers:
+        try:
+            handler = logging.handlers.RotatingFileHandler(
+                _get_log_path(),
+                maxBytes=LOG_MAX_BYTES,
+                backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            handler.setFormatter(logging.Formatter(
+                "[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+            ))
+            logger.addHandler(handler)
+        except Exception:
+            # Échec d'init du fichier de log : on ajoute un handler "null" pour
+            # que les .error() ne crashent pas. L'app continue sans log fichier.
+            logger.addHandler(logging.NullHandler())
+    return logger
+
+
+_error_logger = _setup_error_logger()
 
 
 # =============================================================================
@@ -228,10 +275,6 @@ class SyncHandler(FileSystemEventHandler):
         self._dest_lost_notified = False  # Évite le spam quand la dest est partie
         self.error_count = 0
 
-        # Chemin du fichier de log des erreurs (à côté du script)
-        self.error_log_path = Path(sys.executable).parent / LOG_FILE_NAME \
-            if getattr(sys, 'frozen', False) else Path(__file__).parent / LOG_FILE_NAME
-
     def _is_dest_accessible(self):
         """Test rapide d'accessibilité de la destination racine."""
         try:
@@ -275,15 +318,9 @@ class SyncHandler(FileSystemEventHandler):
             return  # On n'écrit rien dans le log : ce serait du bruit
 
         self.error_count += 1
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        error_msg = f"[{timestamp}] {operation} ERREUR: {path}\n    -> {str(error)}\n"
-
-        # Écriture dans le fichier log
-        try:
-            with open(self.error_log_path, "a", encoding="utf-8") as f:
-                f.write(error_msg)
-        except Exception:
-            pass  # Même l'écriture du log ne doit pas bloquer
+        # Logging avec rotation automatique (RotatingFileHandler).
+        # logger.error() n'élève jamais d'exception → safe en H24.
+        _error_logger.error(f"{operation} ERREUR: {path}\n    -> {error}")
 
         # Affichage dans l'interface
         self.log_callback(f"❌ ERREUR: {Path(path).name} - {str(error)[:50]}", "error")
@@ -756,10 +793,23 @@ class SimpleCloneApp:
         )
 
     def _log(self, message, tag="info"):
-        """Ajoute un message dans la zone de log."""
+        """
+        Ajoute un message dans la zone de log de l'UI.
+        Plafonne le nombre de lignes pour éviter une fuite mémoire en H24 :
+        au-delà de MAX_LOG_LINES_UI, on supprime un lot du début (par lots
+        plutôt que ligne par ligne, c'est nettement moins coûteux).
+        """
         self.log_text.configure(state=tk.NORMAL)
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.insert(tk.END, f"[{timestamp}] {message}\n", tag)
+
+        line_count = int(self.log_text.index("end-1c").split(".")[0])
+        if line_count > MAX_LOG_LINES_UI:
+            # On supprime LOG_TRIM_BATCH lignes (en plus du surplus) pour
+            # ne pas retomber dans la condition au prochain insert.
+            excess = line_count - MAX_LOG_LINES_UI + LOG_TRIM_BATCH
+            self.log_text.delete("1.0", f"{excess + 1}.0")
+
         self.log_text.see(tk.END)  # Auto-scroll vers le bas
         self.log_text.configure(state=tk.DISABLED)
 
