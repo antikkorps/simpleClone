@@ -93,21 +93,26 @@ def _stub_modules():
 
 
 # -----------------------------------------------------------------------------
-# Import dynamique de SimpleClone.py (pas un package)
+# Import dynamique de simpleclone_core (la couche testable, sans UI)
 # -----------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
 def sc():
-    """Charge le module SimpleClone une seule fois pour la session."""
-    if "SimpleClone" in sys.modules:
-        return sys.modules["SimpleClone"]
+    """
+    Charge simpleclone_core une seule fois pour la session.
+    On charge le core et pas l'entry point SimpleClone.py : les tests n'ont
+    besoin de rien de l'UI, et importer le core évite de tirer tkinter +
+    pystray inutilement.
+    """
+    if "simpleclone_core" in sys.modules:
+        return sys.modules["simpleclone_core"]
     project_root = Path(__file__).resolve().parent.parent
     spec = importlib.util.spec_from_file_location(
-        "SimpleClone", project_root / "SimpleClone.py"
+        "simpleclone_core", project_root / "simpleclone_core.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    sys.modules["SimpleClone"] = module
+    sys.modules["simpleclone_core"] = module
     return module
 
 
