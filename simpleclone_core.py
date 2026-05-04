@@ -29,7 +29,7 @@ from watchdog.events import FileSystemEventHandler
 # CONFIGURATION
 # =============================================================================
 
-APP_VERSION = "0.10.0"  # À mettre à jour à chaque release (utilisé dans le diagnostic)
+APP_VERSION = "0.11.0"  # À mettre à jour à chaque release (utilisé dans le diagnostic)
 
 ARCHIVE_FOLDER_NAME = "_Archive"  # Dossier où sont déplacés les fichiers supprimés
 
