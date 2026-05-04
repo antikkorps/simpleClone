@@ -12,6 +12,15 @@ Surveille un dossier source et réplique automatiquement les changements vers un
 | Fichier supprimé        | Déplacé vers `_Archive/` (avec horodatage) |
 | Dossier renommé/déplacé | Reproduit côté destination                 |
 | Démarrage               | Synchronisation initiale complète          |
+| Clé USB débranchée      | Pause auto + retry + reprise au rebranchement |
+
+### Plus
+
+- **Démarrage avec Windows** (registre HKCU, sans droits admin)
+- **Démarrage automatique de la surveillance** à l'ouverture de l'app
+- **Zone de notification** (system tray) : la fenêtre se minimise au lieu de se fermer
+- **Configuration persistante** : chemins et options sauvegardés dans `%APPDATA%\SimpleClone\config.json`
+- **Rotation automatique** du fichier de log (5 Mo × 3 backups)
 
 ## Installation
 
@@ -58,13 +67,38 @@ python SimpleClone.py
 
 Cliquer sur le bouton rouge **ARRÊTER LA SURVEILLANCE**.
 
-## IMPORTANT - Clé USB
+## Démarrage automatique avec Windows
 
-**Arrêtez TOUJOURS la surveillance AVANT de débrancher la clé USB !**
+Deux cases à cocher dans l'interface :
 
-Si la clé est débranchée pendant que la surveillance tourne, des erreurs "Disque non prêt" seront générées en boucle.
+- **Démarrer avec Windows** : ajoute une entrée dans
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (pas besoin de droits admin)
+- **Lancer la surveillance automatiquement** : démarre la sync dès l'ouverture de l'app
+
+Combinées, ces deux options font tourner SimpleClone en permanence sans intervention. L'app se loge dans la zone de notification (zone à côté de l'horloge) ; double-clic pour rouvrir la fenêtre.
+
+## Comportement clé USB
+
+Si la clé est débranchée pendant la surveillance, l'app **ne crashe pas et ne spamme pas le log**. Elle bascule en pause (indicateur orange, statut "En pause — destination inaccessible") et vérifie toutes les 5 secondes si la clé revient.
+
+Au rebranchement, une resynchronisation complète est lancée automatiquement. Les fichiers qui ont été supprimés de la source pendant la pause sont **déplacés dans `_Archive/`** (jamais supprimés définitivement) pour rester cohérents avec le comportement habituel de l'app.
+
+Vous pouvez donc débrancher la clé sans précaution particulière (mais toujours via "Éjecter le périphérique" pour éviter une corruption FS).
 
 ## Créer un exécutable Windows (.exe)
+
+### Option 1 : automatique via GitHub Actions (recommandé)
+
+Un workflow `.github/workflows/build-windows.yml` est inclus. Il déclenche un build Windows à chaque tag `v*.*.*` :
+
+```bash
+git tag v1.2.0
+git push --tags
+```
+
+L'exécutable apparaît ensuite dans l'onglet **Releases** du dépôt GitHub. Pas besoin d'avoir Windows en local.
+
+### Option 2 : manuel sur Windows
 
 ```bash
 # 1. Activer le venv
