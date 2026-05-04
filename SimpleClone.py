@@ -834,14 +834,14 @@ class SimpleCloneApp:
         self.cb_autostart_surveillance.pack(side=tk.LEFT)
 
         # === BOUTON PRINCIPAL ===
+        # bg piloté par _set_state (vert au repos, orange quand actif/en pause)
         self.start_button = tk.Button(
             main_frame,
             text="▶ DÉMARRER LA SURVEILLANCE",
             command=self._toggle_surveillance,
             font=("Segoe UI", 12, "bold"),
-            bg="#4CAF50",
+            bg=COLOR_RUNNING,
             fg="white",
-            activebackground="#45a049",
             activeforeground="white",
             height=2,
             cursor="hand2"
@@ -972,19 +972,22 @@ class SimpleCloneApp:
         """
         Centralise les transitions d'état et l'UI associée.
         Doit être appelée depuis le main thread (utiliser root.after sinon).
+        Le bouton "Arrêter" est orange (et non rouge) : le rouge dramatisait
+        une action triviale (la surveillance se relance en un clic) et créait
+        un faux signal d'alerte alors que le statut indicateur est vert.
         """
         self.state = new_state
         if new_state == STATE_RUNNING:
-            self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg="#f44336")
+            self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg=COLOR_PAUSED)
             self.status_indicator.configure(fg=COLOR_RUNNING)
             self.warning_frame.pack(fill=tk.X, pady=(0, 5))
         elif new_state == STATE_PAUSED_USB:
-            self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg="#f44336")
+            self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg=COLOR_PAUSED)
             self.status_indicator.configure(fg=COLOR_PAUSED)
             self.warning_frame.pack(fill=tk.X, pady=(0, 5))
             self.status_var.set("⏸ En pause — destination inaccessible")
         else:  # STATE_STOPPED
-            self.start_button.configure(text="▶ DÉMARRER LA SURVEILLANCE", bg="#4CAF50")
+            self.start_button.configure(text="▶ DÉMARRER LA SURVEILLANCE", bg=COLOR_RUNNING)
             self.status_indicator.configure(fg="gray")
             self.warning_frame.pack_forget()
 
