@@ -31,6 +31,18 @@ from watchdog.observers.polling import PollingObserver  # Plus fiable sur Window
 
 from simpleclone_core import *  # noqa: F401,F403  — voir docstring du module
 
+# `from X import *` filtre les noms underscored par défaut. On importe donc
+# explicitement les helpers privés que le dialog d'aide et les méthodes UI
+# consomment directement. Sans cette ligne, _show_help_dialog crashe avec un
+# NameError silencieusement attrapé par tk → fenêtre Toplevel vide à l'écran
+# (régression introduite et publiée en v0.11.0).
+from simpleclone_core import (
+    _resolve_log_dir,
+    _format_uptime,
+    _find_last_activity_event,
+    _state_to_french,
+)
+
 # System tray (pystray + Pillow) : optionnel.
 # Si non installé, l'app fonctionne sans icône dans la zone de notification.
 # On limite le tray à Windows : sur WSL/Linux pystray a besoin de X11 et plante
