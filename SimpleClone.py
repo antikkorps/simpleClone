@@ -22,6 +22,17 @@ from tkinter import ttk
 from watchdog.observers.polling import PollingObserver  # Plus fiable sur Windows/USB
 from watchdog.events import FileSystemEventHandler
 
+# System tray (pystray + Pillow) : optionnel.
+# Si non installé, l'app fonctionne sans icône dans la zone de notification.
+# On limite le tray à Windows : sur WSL/Linux pystray a besoin de X11 et plante
+# souvent dans les environnements headless.
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = (sys.platform == "win32")
+except ImportError:
+    TRAY_AVAILABLE = False
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -35,6 +46,19 @@ DEST_RETRY_INTERVAL = 5  # Délai entre deux tentatives de reconnexion de la des
 STATE_STOPPED = "stopped"
 STATE_RUNNING = "running"
 STATE_PAUSED_USB = "paused_usb"  # Destination inaccessible (clé débranchée)
+
+# Couleurs des icônes (zone de notification + indicateur UI)
+COLOR_STOPPED = "#808080"   # gris
+COLOR_RUNNING = "#4CAF50"   # vert
+COLOR_PAUSED = "#f57c00"    # orange
+
+
+def _make_tray_icon_image(color_hex):
+    """Génère une icône 64x64 (disque coloré) pour la zone de notification."""
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))  # Fond transparent
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((6, 6, 58, 58), fill=color_hex, outline="#222222", width=2)
+    return img
 
 
 # =============================================================================
@@ -534,6 +558,8 @@ class SimpleCloneApp:
         self.state = STATE_STOPPED
         self.handler = None  # Référence au SyncHandler courant (pour reset des flags)
         self._retry_thread = None  # Thread de retry quand la dest est inaccessible
+        self.tray_icon = None  # Icône zone de notification (None si pystray indispo)
+        self._tray_images = {}  # Cache des images d'icône par état
 
         # Style
         self.root.configure(bg="#f0f0f0")
@@ -542,6 +568,22 @@ class SimpleCloneApp:
 
         # Gestion de la fermeture
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # Initialisation de l'icône dans la zone de notification (Windows uniquement).
+        # Si pystray n'est pas dispo, l'app continue sans tray (clic sur X = quitter).
+        self._setup_tray()
+
+        # --minimized : démarrage caché (typique de l'autostart Windows). On ne
+        # cache la fenêtre que si on a un tray pour permettre de la rouvrir,
+        # sinon l'utilisateur n'aurait aucun moyen de revenir à l'UI.
+        if args and getattr(args, "minimized", False):
+            if self.tray_icon is not None:
+                self.root.withdraw()
+            else:
+                self._log(
+                    "⚠ Démarrage --minimized ignoré : pystray non disponible",
+                    "warning"
+                )
 
         # Démarrage automatique de la surveillance si demandé ET chemins valides.
         # Délai 500ms pour laisser l'UI s'afficher avant de lancer le thread de sync.
@@ -739,17 +781,25 @@ class SimpleCloneApp:
         self.state = new_state
         if new_state == STATE_RUNNING:
             self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg="#f44336")
-            self.status_indicator.configure(fg="#4CAF50")  # vert
+            self.status_indicator.configure(fg=COLOR_RUNNING)
             self.warning_frame.pack(fill=tk.X, pady=(0, 5))
         elif new_state == STATE_PAUSED_USB:
             self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg="#f44336")
-            self.status_indicator.configure(fg="#f57c00")  # orange
+            self.status_indicator.configure(fg=COLOR_PAUSED)
             self.warning_frame.pack(fill=tk.X, pady=(0, 5))
             self.status_var.set("⏸ En pause — destination inaccessible")
         else:  # STATE_STOPPED
             self.start_button.configure(text="▶ DÉMARRER LA SURVEILLANCE", bg="#4CAF50")
             self.status_indicator.configure(fg="gray")
             self.warning_frame.pack_forget()
+
+        # Met à jour l'icône de la zone de notification + le menu (label dynamique)
+        if self.tray_icon is not None:
+            self.tray_icon.icon = self._tray_images.get(new_state)
+            try:
+                self.tray_icon.update_menu()
+            except Exception:
+                pass  # update_menu peut être absent selon la version de pystray
 
     def _toggle_surveillance(self):
         """Démarre ou arrête la surveillance (selon l'état courant)."""
@@ -943,17 +993,94 @@ class SimpleCloneApp:
         else:
             self._log("⏹️ Surveillance arrêtée", "warning")
 
+    # -------------------------------------------------------------------------
+    # ZONE DE NOTIFICATION (system tray)
+    # -------------------------------------------------------------------------
+
+    def _setup_tray(self):
+        """Initialise l'icône dans la zone de notification (Windows uniquement)."""
+        if not TRAY_AVAILABLE:
+            return
+
+        self._tray_images = {
+            STATE_STOPPED: _make_tray_icon_image(COLOR_STOPPED),
+            STATE_RUNNING: _make_tray_icon_image(COLOR_RUNNING),
+            STATE_PAUSED_USB: _make_tray_icon_image(COLOR_PAUSED),
+        }
+
+        # Le label "Démarrer/Arrêter" se calcule à la volée, ce qui permet à
+        # update_menu() de refléter l'état courant à chaque changement.
+        def toggle_label(_item):
+            return ("Arrêter la surveillance"
+                    if self.state != STATE_STOPPED
+                    else "Démarrer la surveillance")
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Afficher SimpleClone", self._tray_show, default=True),
+            pystray.MenuItem(toggle_label, self._tray_toggle_surveillance),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quitter", self._tray_quit),
+        )
+
+        self.tray_icon = pystray.Icon(
+            "SimpleClone",
+            self._tray_images[STATE_STOPPED],
+            "SimpleClone",
+            menu,
+        )
+
+        # pystray.Icon.run() est bloquant : on le lance dans un thread daemon
+        threading.Thread(target=self._run_tray_safely, daemon=True).start()
+
+    def _run_tray_safely(self):
+        """Wrapper pour ne pas crasher l'app si pystray échoue à s'initialiser."""
+        try:
+            self.tray_icon.run()
+        except Exception:
+            self.tray_icon = None  # Désactive le tray, l'UI reste fonctionnelle
+
+    def _tray_show(self, icon=None, item=None):
+        """Restaure la fenêtre principale depuis la zone de notification."""
+        self.root.after(0, lambda: (self.root.deiconify(), self.root.lift()))
+
+    def _tray_toggle_surveillance(self, icon=None, item=None):
+        """Démarre/arrête la surveillance depuis le menu tray."""
+        self.root.after(0, self._toggle_surveillance)
+
+    def _tray_quit(self, icon=None, item=None):
+        """Quitter définitivement (depuis le menu tray)."""
+        self.root.after(0, self._quit_app)
+
+    def _quit_app(self):
+        """Sortie propre de l'application : stop surveillance + tray + UI."""
+        if self.state != STATE_STOPPED:
+            self._stop_surveillance()
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
+        self.root.destroy()
+
     def _on_closing(self):
-        """Gère la fermeture de l'application."""
+        """
+        Clic sur la croix (X) de la fenêtre.
+        Si le tray est actif → on cache la fenêtre, l'app continue en arrière-plan.
+        Sinon → comportement classique (confirmation puis fermeture).
+        """
+        if self.tray_icon is not None:
+            self.root.withdraw()
+            return
+
         if self.state != STATE_STOPPED:
             if messagebox.askokcancel(
                 "Quitter",
                 "La surveillance est en cours.\nVoulez-vous vraiment quitter ?"
             ):
-                self._stop_surveillance()
-                self.root.destroy()
+                self._quit_app()
         else:
-            self.root.destroy()
+            self._quit_app()
 
 
 # =============================================================================
