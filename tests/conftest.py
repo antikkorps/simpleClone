@@ -31,7 +31,7 @@ class _Stub:
 
 
 def _install_stubs():
-    """Installe les stubs tkinter + watchdog dans sys.modules."""
+    """Installe les stubs tkinter + watchdog + pystray/PIL dans sys.modules."""
     for name in (
         "tkinter",
         "tkinter.filedialog",
@@ -40,6 +40,16 @@ def _install_stubs():
         "tkinter.ttk",
     ):
         sys.modules.setdefault(name, _Stub())
+
+    # pystray et PIL doivent être stubbés AVANT l'import de SimpleClone :
+    # pystray essaie de se connecter à X11 dès l'import (via Xlib), ce qui
+    # plante sur un runner Ubuntu headless. Avec ces stubs, le bloc try
+    # d'import du module réussit et TRAY_AVAILABLE retombe à False sur
+    # toute plateforme non-Windows (logique inchangée pour le runtime réel).
+    sys.modules.setdefault("pystray", _Stub())
+    sys.modules.setdefault("PIL", _Stub())
+    sys.modules.setdefault("PIL.Image", _Stub())
+    sys.modules.setdefault("PIL.ImageDraw", _Stub())
 
     if "watchdog" not in sys.modules:
         watchdog = type(sys)("watchdog")
