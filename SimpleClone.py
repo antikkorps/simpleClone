@@ -29,6 +29,12 @@ from watchdog.events import FileSystemEventHandler
 ARCHIVE_FOLDER_NAME = "_Archive"  # Dossier où sont déplacés les fichiers supprimés
 LOG_FILE_NAME = "SimpleClone_Errors.log"
 DEFAULT_POLLING_INTERVAL = 2  # Intervalle de vérification en secondes (polling)
+DEST_RETRY_INTERVAL = 5  # Délai entre deux tentatives de reconnexion de la destination
+
+# États de la surveillance
+STATE_STOPPED = "stopped"
+STATE_RUNNING = "running"
+STATE_PAUSED_USB = "paused_usb"  # Destination inaccessible (clé débranchée)
 
 
 # =============================================================================
@@ -184,18 +190,30 @@ class SyncHandler(FileSystemEventHandler):
     Réplique chaque changement de la source vers la destination.
     """
 
-    def __init__(self, source_path, dest_path, log_callback, status_callback):
+    def __init__(self, source_path, dest_path, log_callback, status_callback,
+                 on_dest_lost=None):
         super().__init__()
         self.source_path = Path(source_path)
         self.dest_path = Path(dest_path)
         self.archive_path = self.dest_path / ARCHIVE_FOLDER_NAME
         self.log_callback = log_callback  # Fonction pour afficher les logs dans l'interface
         self.status_callback = status_callback  # Fonction pour mettre à jour le statut
+        # Callback appelé quand on détecte que la destination n'est plus accessible
+        # (clé USB débranchée). L'app bascule alors en mode PAUSED_USB.
+        self.on_dest_lost = on_dest_lost
+        self._dest_lost_notified = False  # Évite le spam quand la dest est partie
         self.error_count = 0
 
         # Chemin du fichier de log des erreurs (à côté du script)
         self.error_log_path = Path(sys.executable).parent / LOG_FILE_NAME \
             if getattr(sys, 'frozen', False) else Path(__file__).parent / LOG_FILE_NAME
+
+    def _is_dest_accessible(self):
+        """Test rapide d'accessibilité de la destination racine."""
+        try:
+            return self.dest_path.is_dir()
+        except OSError:
+            return False  # Drive débranché : .is_dir() peut lever sur Windows
 
     def _get_dest_path(self, src_path):
         """Calcule le chemin de destination équivalent pour un chemin source."""
@@ -214,7 +232,24 @@ class SyncHandler(FileSystemEventHandler):
         """
         Enregistre une erreur dans le fichier log ET continue l'exécution.
         C'est crucial : le script ne doit JAMAIS s'arrêter sur une erreur.
+        Si la destination n'est plus accessible (clé USB débranchée), on déclenche
+        une bascule en pause au lieu de spammer le log à chaque opération qui rate.
         """
+        # Détection débranchement USB : si la dest racine n'existe plus, on
+        # considère qu'on est dans ce cas. On notifie l'app UNE SEULE fois et
+        # on n'écrit pas l'erreur dans le log (évite SimpleClone_Errors.log
+        # qui grossit de plusieurs Mo en quelques minutes).
+        if not self._is_dest_accessible():
+            if not self._dest_lost_notified:
+                self._dest_lost_notified = True
+                self.log_callback(
+                    "⚠ Destination inaccessible — mise en pause automatique",
+                    "warning"
+                )
+                if self.on_dest_lost:
+                    self.on_dest_lost()
+            return  # On n'écrit rien dans le log : ce serait du bruit
+
         self.error_count += 1
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         error_msg = f"[{timestamp}] {operation} ERREUR: {path}\n    -> {str(error)}\n"
@@ -345,10 +380,18 @@ class SyncHandler(FileSystemEventHandler):
 # SYNCHRONISATION INITIALE
 # =============================================================================
 
-def initial_sync(source_path, dest_path, handler, progress_callback, log_callback):
+def initial_sync(source_path, dest_path, handler, progress_callback, log_callback,
+                 archive_orphans=False):
     """
     Effectue une copie initiale complète de la source vers la destination.
     Appelée au démarrage de la surveillance.
+
+    archive_orphans : si True, archive les fichiers présents dans la destination
+    mais absents de la source (cas du retour de pause USB : pendant que la clé
+    était débranchée, l'utilisateur a pu supprimer des fichiers de la source —
+    ces fichiers existent encore sur la clé, on les déplace dans _Archive/
+    pour rester cohérent avec le comportement habituel de l'app).
+    Le dossier _Archive/ lui-même est exclu du balayage.
     """
     source = Path(source_path)
     dest = Path(dest_path)
@@ -407,6 +450,47 @@ def initial_sync(source_path, dest_path, handler, progress_callback, log_callbac
                 copied_files += 1
                 progress_callback(copied_files, total_files)
 
+    # Balayage d'orphelins (uniquement au retour d'une pause USB) :
+    # archive les fichiers qui sont en dest mais plus en source.
+    if archive_orphans:
+        log_callback("🔍 Recherche de fichiers orphelins (supprimés pendant la pause)...", "info")
+        orphans_archived = 0
+        for root, dirs, files in os.walk(dest):
+            root_path = Path(root)
+            # Exclure le dossier d'archive lui-même : ses sous-dossiers ne
+            # doivent jamais être ré-archivés (boucle infinie).
+            try:
+                rel_parts = root_path.relative_to(dest).parts
+            except ValueError:
+                continue
+            if ARCHIVE_FOLDER_NAME in rel_parts:
+                # On ne descend pas dans _Archive/
+                dirs[:] = []
+                continue
+            # On évite aussi de descendre dans _Archive/ depuis la racine
+            if ARCHIVE_FOLDER_NAME in dirs:
+                dirs.remove(ARCHIVE_FOLDER_NAME)
+
+            for file_name in files:
+                dest_file = root_path / file_name
+                try:
+                    rel_path = dest_file.relative_to(dest)
+                    src_equiv = source / rel_path
+                    if not src_equiv.exists():
+                        # Fichier orphelin : archive (pas suppression)
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        archive_name = f"{rel_path.stem}_{timestamp}{rel_path.suffix}"
+                        archive_target = dest / ARCHIVE_FOLDER_NAME / rel_path.parent / archive_name
+                        archive_target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(dest_file), str(archive_target))
+                        orphans_archived += 1
+                        log_callback(f"📦 Orphelin archivé: {file_name}", "info")
+                except Exception as e:
+                    handler._log_error("ARCHIVAGE ORPHELIN", str(dest_file), e)
+                    error_count += 1
+        if orphans_archived:
+            log_callback(f"📦 {orphans_archived} orphelin(s) archivé(s)", "info")
+
     return total_files, error_count
 
 
@@ -447,7 +531,9 @@ class SimpleCloneApp:
         )
         self.status_var = tk.StringVar(value="Prêt - Sélectionnez les dossiers")
         self.observer = None
-        self.is_running = False
+        self.state = STATE_STOPPED
+        self.handler = None  # Référence au SyncHandler courant (pour reset des flags)
+        self._retry_thread = None  # Thread de retry quand la dest est inaccessible
 
         # Style
         self.root.configure(bg="#f0f0f0")
@@ -645,12 +731,33 @@ class SimpleCloneApp:
             progress = (current / total) * 100
             self.root.after(0, lambda: self.progress.configure(value=progress))
 
+    def _set_state(self, new_state):
+        """
+        Centralise les transitions d'état et l'UI associée.
+        Doit être appelée depuis le main thread (utiliser root.after sinon).
+        """
+        self.state = new_state
+        if new_state == STATE_RUNNING:
+            self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg="#f44336")
+            self.status_indicator.configure(fg="#4CAF50")  # vert
+            self.warning_frame.pack(fill=tk.X, pady=(0, 5))
+        elif new_state == STATE_PAUSED_USB:
+            self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg="#f44336")
+            self.status_indicator.configure(fg="#f57c00")  # orange
+            self.warning_frame.pack(fill=tk.X, pady=(0, 5))
+            self.status_var.set("⏸ En pause — destination inaccessible")
+        else:  # STATE_STOPPED
+            self.start_button.configure(text="▶ DÉMARRER LA SURVEILLANCE", bg="#4CAF50")
+            self.status_indicator.configure(fg="gray")
+            self.warning_frame.pack_forget()
+
     def _toggle_surveillance(self):
-        """Démarre ou arrête la surveillance."""
-        if self.is_running:
-            self._stop_surveillance()
-        else:
+        """Démarre ou arrête la surveillance (selon l'état courant)."""
+        if self.state == STATE_STOPPED:
             self._start_surveillance()
+        else:
+            # RUNNING ou PAUSED_USB → arrêt manuel
+            self._stop_surveillance()
 
     def _start_surveillance(self):
         """Démarre la surveillance du dossier source."""
@@ -677,29 +784,30 @@ class SimpleCloneApp:
             messagebox.showerror("Erreur", f"Impossible de créer le dossier destination:\n{e}")
             return
 
-        self.is_running = True
-        self.start_button.configure(
-            text="⏹ ARRÊTER LA SURVEILLANCE",
-            bg="#f44336"
-        )
-        self.status_indicator.configure(fg="#4CAF50")
-        self.warning_frame.pack(fill=tk.X, pady=(0, 5))  # Affiche l'avertissement USB
+        self._set_state(STATE_RUNNING)
         self._update_status("Synchronisation initiale...")
         self._log("🚀 Démarrage de la surveillance...", "info")
 
         # Lance la synchronisation initiale dans un thread séparé
         # pour ne pas bloquer l'interface
-        threading.Thread(target=self._run_sync, args=(source, dest), daemon=True).start()
+        threading.Thread(
+            target=self._run_sync,
+            args=(source, dest),
+            kwargs={"archive_orphans": False},
+            daemon=True,
+        ).start()
 
-    def _run_sync(self, source, dest):
-        """Exécute la synchronisation (dans un thread séparé)."""
-        # Crée le gestionnaire d'événements
+    def _run_sync(self, source, dest, archive_orphans=False):
+        """Exécute la synchronisation initiale puis lance l'observer (thread séparé)."""
+        # Crée le gestionnaire d'événements (avec callback pour débranchement USB)
         handler = SyncHandler(
             source,
             dest,
             lambda msg, tag: self.root.after(0, lambda: self._log(msg, tag)),
-            self._update_status
+            self._update_status,
+            on_dest_lost=lambda: self.root.after(0, self._on_dest_lost),
         )
+        self.handler = handler
 
         # Synchronisation initiale
         self._log("📋 Copie initiale en cours...", "info")
@@ -708,17 +816,24 @@ class SimpleCloneApp:
             dest,
             handler,
             self._update_progress,
-            lambda msg, tag: self.root.after(0, lambda: self._log(msg, tag))
+            lambda msg, tag: self.root.after(0, lambda: self._log(msg, tag)),
+            archive_orphans=archive_orphans,
         )
+
+        # Si on a perdu la dest pendant la sync initiale, on n'enchaîne pas l'observer
+        if self.state != STATE_RUNNING:
+            return
 
         # Message de fin de synchro initiale
         if errors > 0:
             self._log(f"⚠️ Copie initiale terminée avec {errors} erreur(s)", "warning")
-            self.root.after(0, lambda: messagebox.showwarning(
-                "Copie initiale",
-                f"Copie initiale terminée, mais {errors} fichier(s) n'ont pas pu être copiés.\n"
-                f"Consultez {LOG_FILE_NAME} pour les détails."
-            ))
+            # Pas de popup au retour de pause USB (l'utilisateur n'est peut-être pas devant l'écran)
+            if not archive_orphans:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "Copie initiale",
+                    f"Copie initiale terminée, mais {errors} fichier(s) n'ont pas pu être copiés.\n"
+                    f"Consultez {LOG_FILE_NAME} pour les détails."
+                ))
         else:
             self._log(f"✅ Copie initiale terminée ({total} fichiers)", "success")
 
@@ -737,26 +852,100 @@ class SimpleCloneApp:
         self._log("👁️ Surveillance active - En attente de changements...", "info")
         self.root.after(0, lambda: self.progress.configure(value=0))
 
-    def _stop_surveillance(self):
-        """Arrête la surveillance."""
+    def _on_dest_lost(self):
+        """
+        Appelé (depuis le main thread) quand le SyncHandler détecte que la
+        destination est devenue inaccessible. Bascule en PAUSED_USB et lance
+        un thread de retry qui vérifiera périodiquement le retour de la dest.
+        """
+        if self.state != STATE_RUNNING:
+            return  # Déjà en pause ou arrêté : rien à faire
+
+        # Stop l'observer (peut lever des exceptions sur la dest disparue → on ignore)
         if self.observer:
-            self.observer.stop()
-            self.observer.join(timeout=2)
+            try:
+                self.observer.stop()
+                self.observer.join(timeout=2)
+            except Exception:
+                pass
             self.observer = None
 
-        self.is_running = False
-        self.start_button.configure(
-            text="▶ DÉMARRER LA SURVEILLANCE",
-            bg="#4CAF50"
-        )
-        self.status_indicator.configure(fg="gray")
-        self.warning_frame.pack_forget()  # Cache l'avertissement USB
+        self._set_state(STATE_PAUSED_USB)
+        self._log("⏸ Surveillance en pause — destination inaccessible", "warning")
+
+        # Lance le thread de retry (un seul à la fois)
+        if self._retry_thread is None or not self._retry_thread.is_alive():
+            self._retry_thread = threading.Thread(target=self._dest_retry_loop, daemon=True)
+            self._retry_thread.start()
+
+    def _dest_retry_loop(self):
+        """
+        Boucle exécutée dans un thread daemon : vérifie périodiquement si la
+        destination est revenue. Sort dès que l'état n'est plus PAUSED_USB
+        (l'utilisateur a cliqué sur Arrêter, ou la reprise a été déclenchée).
+        """
+        dest = self.dest_var.get()
+        while self.state == STATE_PAUSED_USB:
+            time.sleep(DEST_RETRY_INTERVAL)
+            if self.state != STATE_PAUSED_USB:
+                return
+            try:
+                if Path(dest).is_dir():
+                    # Dest revenue : on déclenche la reprise depuis le main thread
+                    self.root.after(0, self._resume_from_usb_pause)
+                    return
+            except OSError:
+                pass  # Dest toujours absente, on continue d'attendre
+
+    def _resume_from_usb_pause(self):
+        """
+        Reprise depuis PAUSED_USB → RUNNING.
+        Relance une sync complète AVEC archivage des orphelins (au cas où des
+        fichiers ont été supprimés de la source pendant la pause).
+        """
+        if self.state != STATE_PAUSED_USB:
+            return  # État changé entre temps (arrêt manuel) : on annule
+
+        source = self.source_var.get()
+        dest = self.dest_var.get()
+        if not source or not os.path.isdir(source):
+            return
+
+        self._set_state(STATE_RUNNING)
+        self._log("✅ Destination détectée — reprise de la surveillance", "success")
+        self._update_status("Resynchronisation après reconnexion...")
+
+        threading.Thread(
+            target=self._run_sync,
+            args=(source, dest),
+            kwargs={"archive_orphans": True},
+            daemon=True,
+        ).start()
+
+    def _stop_surveillance(self):
+        """Arrête la surveillance (depuis n'importe quel état actif)."""
+        previous_state = self.state
+        # Le passage à STATE_STOPPED fait sortir le thread retry de sa boucle
+        self._set_state(STATE_STOPPED)
+
+        if self.observer:
+            try:
+                self.observer.stop()
+                self.observer.join(timeout=2)
+            except Exception:
+                pass
+            self.observer = None
+
+        self.handler = None
         self._update_status("Surveillance arrêtée")
-        self._log("⏹️ Surveillance arrêtée", "warning")
+        if previous_state == STATE_PAUSED_USB:
+            self._log("⏹️ Surveillance arrêtée (était en pause USB)", "warning")
+        else:
+            self._log("⏹️ Surveillance arrêtée", "warning")
 
     def _on_closing(self):
         """Gère la fermeture de l'application."""
-        if self.is_running:
+        if self.state != STATE_STOPPED:
             if messagebox.askokcancel(
                 "Quitter",
                 "La surveillance est en cours.\nVoulez-vous vraiment quitter ?"
