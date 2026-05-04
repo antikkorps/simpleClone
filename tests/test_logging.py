@@ -96,3 +96,32 @@ def test_log_activity_handles_unicode_paths(sc, isolated_logs):
     entry = json.loads(line)
     assert entry["src"] == "/données/éléphant.txt"
     assert entry["dest"] == "/Z/élé.txt"
+
+
+def test_lifecycle_events_have_expected_schema(sc, isolated_logs):
+    """
+    Schéma des entrées lifecycle (app_start, heartbeat, app_stop) :
+    consommées par les outils de monitoring côté client, donc on les
+    "fige" via un test pour éviter qu'une refacto silencieuse change le format.
+    """
+    sc.log_activity("app_start")
+    sc.log_activity("heartbeat", state="running", uptime_s=900)
+    sc.log_activity("app_stop", uptime_s=3600)
+    flush_loggers(sc)
+
+    entries = [
+        json.loads(line)
+        for line in (isolated_logs / "activity" / "activity.log")
+        .read_text(encoding="utf-8").strip().splitlines()
+    ]
+    assert len(entries) == 3
+
+    start, beat, stop = entries
+    assert start["op"] == "app_start" and "ts" in start
+
+    assert beat["op"] == "heartbeat"
+    assert beat["state"] == "running"
+    assert beat["uptime_s"] == 900
+
+    assert stop["op"] == "app_stop"
+    assert stop["uptime_s"] == 3600

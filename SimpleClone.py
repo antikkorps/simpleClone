@@ -63,6 +63,11 @@ DEST_RETRY_INTERVAL = 5  # Délai entre deux tentatives de reconnexion de la des
 MAX_LOG_LINES_UI = 1000  # Limite de lignes dans le journal de l'UI (évite la fuite mémoire en H24)
 LOG_TRIM_BATCH = 100     # Nombre de lignes supprimées d'un coup quand la limite est atteinte
 
+# Heartbeat : preuve périodique que l'app est vivante (cas H24 sur site client).
+# 15 minutes est un bon compromis : assez fréquent pour détecter une panne dans
+# l'heure, pas trop pour éviter d'inonder le log d'activité.
+HEARTBEAT_INTERVAL_S = 15 * 60
+
 # États de la surveillance
 STATE_STOPPED = "stopped"
 STATE_RUNNING = "running"
@@ -709,6 +714,11 @@ class SimpleCloneApp:
         # Args CLI (ex: --minimized lors d'un démarrage automatique Windows)
         self.args = args
 
+        # Marqueur de début pour le calcul d'uptime + trace lifecycle.
+        # log_activity est sûr ici : le logger est configuré au chargement du module.
+        self._app_started_at = time.time()
+        log_activity("app_start")
+
         # Config persistante (chargée avant la création des widgets pour pré-remplir)
         self.config = ConfigManager()
         self.config.load()
@@ -771,6 +781,21 @@ class SimpleCloneApp:
         # Délai 500ms pour laisser l'UI s'afficher avant de lancer le thread de sync.
         if self._should_autostart_surveillance():
             self.root.after(500, self._start_surveillance)
+
+        # Première heartbeat planifiée : preuve périodique que l'app tourne.
+        # On laisse passer un cycle complet (15 min) avant le premier tick :
+        # l'entrée app_start ci-dessus tient lieu de "preuve" pour les 15 premières min.
+        self.root.after(HEARTBEAT_INTERVAL_S * 1000, self._heartbeat_tick)
+
+    def _heartbeat_tick(self):
+        """
+        Émet un heartbeat dans le log d'activité et reprogramme le suivant.
+        En cas de crash silencieux ou de kill du process, l'absence de heartbeat
+        > 1h (par exemple) est le signal pour qu'un humain investigue.
+        """
+        uptime_s = int(time.time() - self._app_started_at)
+        log_activity("heartbeat", state=self.state, uptime_s=uptime_s)
+        self.root.after(HEARTBEAT_INTERVAL_S * 1000, self._heartbeat_tick)
 
     def _should_autostart_surveillance(self):
         """Détermine si on doit lancer la surveillance automatiquement au boot."""
@@ -1251,6 +1276,10 @@ class SimpleCloneApp:
 
     def _quit_app(self):
         """Sortie propre de l'application : stop surveillance + tray + UI."""
+        # Trace lifecycle : "fin propre" — distingue d'un crash silencieux dans l'audit.
+        # On émet AVANT le destroy pour s'assurer que la ligne est bien écrite.
+        log_activity("app_stop", uptime_s=int(time.time() - self._app_started_at))
+
         if self.state != STATE_STOPPED:
             self._stop_surveillance()
         if self.tray_icon is not None:
