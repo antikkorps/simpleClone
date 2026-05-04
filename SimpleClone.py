@@ -39,15 +39,19 @@ except ImportError:
 # CONFIGURATION
 # =============================================================================
 
+APP_VERSION = "0.10.0"  # À mettre à jour à chaque release (utilisé dans le diagnostic)
+
 ARCHIVE_FOLDER_NAME = "_Archive"  # Dossier où sont déplacés les fichiers supprimés
 
 # Structure des logs (à côté de l'exe ou dans %APPDATA% en fallback) :
 #   log/
-#   ├── errors/   → SimpleClone_Errors.log (rotation par taille)
-#   └── activity/ → activity.log + activity.log.YYYY-MM-DD (rotation quotidienne, 6 ans)
+#   ├── errors/      → SimpleClone_Errors.log (rotation par taille)
+#   ├── activity/    → activity.log + activity.log.YYYY-MM-DD (rotation quotidienne, 6 ans)
+#   └── diagnostic/  → simpleclone-diagnostic-YYYYMMDD-HHMMSS.txt (export user)
 LOG_DIR_NAME = "log"
 ERRORS_DIR_NAME = "errors"
 ACTIVITY_DIR_NAME = "activity"
+DIAGNOSTIC_DIR_NAME = "diagnostic"
 ERRORS_LOG_FILE_NAME = "SimpleClone_Errors.log"
 ACTIVITY_LOG_FILE_NAME = "activity.log"
 
@@ -699,6 +703,179 @@ def initial_sync(source_path, dest_path, handler, progress_callback, log_callbac
 
 
 # =============================================================================
+# GÉNÉRATION DE DIAGNOSTIC (pour le bouton "?" dans l'UI)
+# =============================================================================
+#
+# Le client n'a pas Internet : un fichier de diagnostic auto-suffisant doit
+# pouvoir être copié sur clé USB et envoyé au support depuis un autre poste.
+# Les fonctions ci-dessous sont écrites pour être TESTABLES indépendamment
+# de l'UI (pas de tkinter), et tolérantes à toute erreur de lecture (un log
+# manquant ne doit pas faire échouer la génération du diagnostic).
+
+def _format_uptime(seconds):
+    """Convertit une durée en secondes en chaîne lisible (ex: '3 j 4 h 22 min')."""
+    seconds = int(max(0, seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} j")
+    if hours or days:
+        parts.append(f"{hours} h")
+    parts.append(f"{minutes} min")
+    return " ".join(parts)
+
+
+def _read_last_n_lines(path, n):
+    """
+    Lit les N dernières lignes d'un fichier texte.
+    Retourne une liste vide si le fichier est inaccessible (ne lève jamais).
+    Implémentation simple (charge tout en mémoire) : suffisant pour nos logs
+    qui font au plus quelques Mo. Pas optimal pour des Go mais ce n'est pas le cas.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return lines[-n:] if len(lines) > n else lines
+    except Exception:
+        return []
+
+
+def _find_last_activity_event(log_dir, op_filter):
+    """
+    Cherche dans activity.log la dernière entrée dont l'op est dans op_filter.
+    Retourne (timestamp_str, src_path) ou (None, None) si rien trouvé.
+    """
+    activity_file = log_dir / ACTIVITY_DIR_NAME / ACTIVITY_LOG_FILE_NAME
+    for line in reversed(_read_last_n_lines(activity_file, 500)):
+        try:
+            entry = json.loads(line)
+            if entry.get("op") in op_filter:
+                return entry.get("ts"), entry.get("src", "—")
+        except Exception:
+            continue
+    return None, None
+
+
+def _state_to_french(state):
+    """Mapping état machine → libellé court pour l'utilisateur."""
+    return {
+        STATE_RUNNING: "EN COURS",
+        STATE_PAUSED_USB: "EN PAUSE — destination inaccessible",
+        STATE_STOPPED: "ARRÊTÉE",
+    }.get(state, state)
+
+
+def build_diagnostic_text(state, source_path, dest_path, started_at, log_dir,
+                          config_data=None):
+    """
+    Construit le contenu textuel du fichier de diagnostic.
+    Pure fonction : prend un snapshot de l'état, retourne une string.
+    Testable sans UI ni tkinter.
+    """
+    now = datetime.now()
+    uptime_seconds = time.time() - started_at if started_at else 0
+    last_copy_ts, last_copy_src = _find_last_activity_event(
+        log_dir, {"copy", "copy_initial"}
+    )
+
+    last_error_lines = _read_last_n_lines(
+        log_dir / ERRORS_DIR_NAME / ERRORS_LOG_FILE_NAME, 1
+    )
+    last_error = last_error_lines[-1].strip() if last_error_lines else "(aucune)"
+
+    sections = []
+
+    sections.append("=" * 60)
+    sections.append("SimpleClone — fichier de diagnostic")
+    sections.append("=" * 60)
+    sections.append(f"Généré le      : {now.isoformat(timespec='seconds')}")
+    sections.append(f"Version app    : {APP_VERSION}")
+    sections.append(f"Python         : {sys.version.split()[0]}")
+    sections.append(f"Plateforme     : {sys.platform}")
+    sections.append("")
+
+    sections.append("--- État de l'application ---")
+    sections.append(f"Surveillance   : {_state_to_french(state)}")
+    sections.append(f"Source         : {source_path or '(non sélectionnée)'}")
+    sections.append(f"Destination    : {dest_path or '(non sélectionnée)'}")
+    sections.append(f"Uptime         : {_format_uptime(uptime_seconds)}")
+    sections.append(f"Démarrée le    : "
+                    f"{datetime.fromtimestamp(started_at).isoformat(timespec='seconds') if started_at else '?'}")
+    sections.append(f"Dernière copie : "
+                    f"{last_copy_ts or 'aucune'} — {last_copy_src or ''}")
+    sections.append(f"Dernière erreur: {last_error}")
+    sections.append(f"Dossier logs   : {log_dir}")
+    sections.append("")
+
+    sections.append("--- Configuration ---")
+    if config_data:
+        for key, value in sorted(config_data.items()):
+            sections.append(f"{key} = {value}")
+    else:
+        sections.append("(non disponible)")
+    sections.append("")
+
+    activity_tail = _read_last_n_lines(
+        log_dir / ACTIVITY_DIR_NAME / ACTIVITY_LOG_FILE_NAME, 200
+    )
+    sections.append(f"--- Journal d'activité (200 dernières lignes) ---")
+    if activity_tail:
+        sections.extend(line.rstrip("\n") for line in activity_tail)
+    else:
+        sections.append("(vide ou inaccessible)")
+    sections.append("")
+
+    errors_tail = _read_last_n_lines(
+        log_dir / ERRORS_DIR_NAME / ERRORS_LOG_FILE_NAME, 100
+    )
+    sections.append(f"--- Journal d'erreurs (100 dernières lignes) ---")
+    if errors_tail:
+        sections.extend(line.rstrip("\n") for line in errors_tail)
+    else:
+        sections.append("(vide ou inaccessible)")
+    sections.append("")
+
+    return "\n".join(sections)
+
+
+def write_diagnostic_file(content, log_dir):
+    """
+    Écrit le diagnostic dans log/diagnostic/ avec un nom horodaté.
+    Retourne le path écrit (ou lève l'exception si l'écriture est impossible —
+    l'UI doit catcher pour afficher un message à l'utilisateur).
+    """
+    diag_dir = log_dir / DIAGNOSTIC_DIR_NAME
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"simpleclone-diagnostic-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+    path = diag_dir / filename
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def reveal_in_file_manager(path):
+    """
+    Ouvre le navigateur de fichiers du système et y met le fichier en évidence.
+    Sur Windows : Explorer avec le fichier pré-sélectionné (highlighté).
+    Sur macOS / Linux : on ouvre le dossier parent à défaut.
+    Silencieux en cas d'échec : c'est un bonus UX, pas un chemin critique.
+    """
+    import subprocess
+    try:
+        if sys.platform == "win32":
+            # /select, demande à Explorer de mettre le fichier en surbrillance
+            subprocess.Popen(["explorer", f"/select,{path}"])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path.parent)])
+        return True
+    except Exception:
+        return False
+
+
+# =============================================================================
 # INTERFACE GRAPHIQUE
 # =============================================================================
 
@@ -815,6 +992,17 @@ class SimpleCloneApp:
         # Frame principal avec padding
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # === HEADER avec bouton d'aide à droite ===
+        # Volontairement minimaliste : titre vide à gauche pour que le "?" soit
+        # bien dans le coin haut droite, comme demandé. C'est l'unique entrée
+        # vers le diagnostic — on ne veut pas pop des dialogues automatiquement.
+        header_frame = ttk.Frame(main_frame)
+        header_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(
+            header_frame, text="?", width=3,
+            command=self._show_help_dialog,
+        ).pack(side=tk.RIGHT)
 
         # === SECTION SOURCE ===
         source_frame = ttk.LabelFrame(main_frame, text="Dossier Source (à surveiller)", padding="5")
@@ -1215,6 +1403,117 @@ class SimpleCloneApp:
             self._log("⏹️ Surveillance arrêtée (était en pause USB)", "warning")
         else:
             self._log("⏹️ Surveillance arrêtée", "warning")
+
+    # -------------------------------------------------------------------------
+    # AIDE / DIAGNOSTIC (bouton "?" en haut à droite)
+    # -------------------------------------------------------------------------
+
+    def _show_help_dialog(self):
+        """
+        Ouvre une fenêtre récapitulative + bouton de génération de diagnostic.
+        Toutes les infos visibles ici sont volontairement répétées dans le
+        fichier de diagnostic — pour permettre à l'utilisateur de prendre
+        une photo de l'écran (s'il n'a pas accès à une clé USB sous la main).
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Aide SimpleClone")
+        dlg.geometry("560x420")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+
+        container = ttk.Frame(dlg, padding=15)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        # Snapshot de l'état actuel pour affichage
+        log_dir = _resolve_log_dir()
+        last_copy_ts, last_copy_src = _find_last_activity_event(
+            log_dir, {"copy", "copy_initial"}
+        )
+        uptime_str = _format_uptime(time.time() - self._app_started_at)
+
+        info_text = (
+            f"État actuel\n"
+            f"───────────\n"
+            f"Surveillance   : {_state_to_french(self.state)}\n"
+            f"Source         : {self.source_var.get() or '(non sélectionnée)'}\n"
+            f"Destination    : {self.dest_var.get() or '(non sélectionnée)'}\n"
+            f"Démarrée depuis: {uptime_str}\n"
+            f"Dernière copie : {last_copy_ts or 'aucune'}"
+            f"{' — ' + last_copy_src if last_copy_src and last_copy_src != '—' else ''}\n"
+            f"Dossier logs   : {log_dir}\n"
+        )
+
+        info_label = tk.Label(
+            container, text=info_text,
+            justify=tk.LEFT, font=("Consolas", 9), anchor="w",
+        )
+        info_label.pack(fill=tk.X, anchor="w")
+
+        explanation = ttk.Label(
+            container,
+            text=(
+                "\nEn cas de problème\n"
+                "──────────────────\n"
+                "Cliquez sur le bouton ci-dessous pour créer un fichier de diagnostic.\n"
+                "Le fichier sera enregistré dans le dossier des logs.\n"
+                "Copiez-le sur une clé USB et envoyez-le à votre contact technique."
+            ),
+            justify=tk.LEFT, font=("Segoe UI", 9),
+        )
+        explanation.pack(fill=tk.X, anchor="w", pady=(5, 10))
+
+        button_row = ttk.Frame(container)
+        button_row.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Button(
+            button_row, text="Créer un fichier de diagnostic",
+            command=lambda: self._create_diagnostic_file(dlg),
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(
+            button_row, text="Fermer",
+            command=dlg.destroy,
+        ).pack(side=tk.RIGHT)
+
+        dlg.grab_set()  # modal
+
+    def _create_diagnostic_file(self, parent_dialog):
+        """
+        Génère le fichier de diagnostic, l'écrit dans log/diagnostic/,
+        et affiche une confirmation à l'utilisateur avec le chemin complet.
+        """
+        log_dir = _resolve_log_dir()
+        try:
+            content = build_diagnostic_text(
+                state=self.state,
+                source_path=self.source_var.get(),
+                dest_path=self.dest_var.get(),
+                started_at=self._app_started_at,
+                log_dir=log_dir,
+                config_data=self.config.data,
+            )
+            path = write_diagnostic_file(content, log_dir)
+            self._log(f"📄 Diagnostic créé : {path.name}", "info")
+            # Ouvre l'Explorateur (ou xdg-open) avec le fichier en évidence
+            # AVANT le messagebox : la fenêtre Explorer apparaît sous le dialog,
+            # l'utilisateur la trouvera juste en fermant le messagebox.
+            reveal_in_file_manager(path)
+            messagebox.showinfo(
+                "Diagnostic créé",
+                f"Le fichier de diagnostic a été créé :\n\n"
+                f"{path}\n\n"
+                f"L'Explorateur de fichiers s'ouvre sur ce fichier.\n"
+                f"Copiez-le sur une clé USB et envoyez-le à votre contact technique.",
+                parent=parent_dialog,
+            )
+        except Exception as e:
+            messagebox.showerror(
+                "Erreur",
+                f"Impossible de créer le fichier de diagnostic :\n{e}\n\n"
+                f"Demandez de l'aide à votre contact technique en lui décrivant "
+                f"le problème observé.",
+                parent=parent_dialog,
+            )
 
     # -------------------------------------------------------------------------
     # ZONE DE NOTIFICATION (system tray)

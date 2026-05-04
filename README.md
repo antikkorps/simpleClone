@@ -215,7 +215,21 @@ $ts = ($last -match '"ts": "([^"]+)"') ; $datetime = [datetime]$matches[1]
 if ((Get-Date) - $datetime -gt [TimeSpan]"01:00:00") { Write-Error "SimpleClone silencieux depuis > 1h" ; exit 1 }
 ```
 
-### 3. En cas d'incident
+### 3. Si l'opérateur signale un problème
+
+L'utilisateur peut **générer un fichier de diagnostic** depuis l'application : clic sur le **bouton `?`** en haut à droite de la fenêtre, puis **"Créer un fichier de diagnostic"**. SimpleClone écrit alors un fichier `simpleclone-diagnostic-DATE-HEURE.txt` dans `log/diagnostic/`, et ouvre l'Explorateur de fichiers Windows directement sur ce fichier.
+
+Le fichier contient :
+- l'état courant (surveillance en cours / en pause / arrêtée)
+- les chemins source et destination
+- la version de SimpleClone, Python, plateforme
+- la configuration JSON
+- les **200 dernières lignes** du journal d'activité
+- les **100 dernières lignes** du journal d'erreurs
+
+L'opérateur copie le fichier sur une clé USB et l'envoie au support technique. Tout le contexte nécessaire est dedans, pas besoin que l'utilisateur sache lire un log.
+
+### 4. En cas d'incident depuis le poste support
 
 **"Le fichier X est manquant en destination."**
 
@@ -236,7 +250,7 @@ grep heartbeat log/activity/activity.log.2026-04-* | tail
 
 Une séquence `app_start` ... `heartbeat` ... `heartbeat` ... `app_stop` est le signe d'un cycle propre. Une absence de `app_stop` après la dernière `heartbeat` indique une **terminaison anormale** (crash, kill, coupure secteur) — informatif pour l'enquête.
 
-### 4. Limitations connues à communiquer au client
+### 5. Limitations connues à communiquer au client
 
 - **Modifications directes sur la destination** : si l'utilisateur modifie un fichier directement sur la clé USB, il sera **écrasé** au prochain événement source. La destination est un miroir de la source, pas un dossier de travail.
 - **Suppressions sur la source** : un fichier supprimé de la source est **archivé** dans `_Archive/` (jamais effacé définitivement par SimpleClone). Pour libérer de l'espace, c'est à l'utilisateur de purger manuellement `_Archive/`.
