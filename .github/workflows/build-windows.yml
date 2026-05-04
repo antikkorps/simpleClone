@@ -6,6 +6,9 @@ on:
       - "v*.*.*"
   workflow_dispatch:  # Permet aussi un build manuel depuis l'onglet Actions
 
+permissions:
+  contents: write  # Requis par softprops/action-gh-release pour créer/éditer les Releases
+
 jobs:
   build:
     runs-on: windows-latest
