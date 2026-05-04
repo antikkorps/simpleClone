@@ -188,12 +188,37 @@ Le log d'erreurs utilise une rotation **par taille** (5 Mo × 3 fichiers maximum
 
 ```
 simpleClone/
-├── SimpleClone.py      # Script principal
-├── requirements.txt    # Dépendances Python
-├── README.md          # Documentation
-└── venv/              # Environnement virtuel (après installation)
+├── SimpleClone.py        # Script principal
+├── requirements.txt      # Dépendances runtime
+├── requirements-dev.txt  # Dépendances de dev (pytest)
+├── tests/                # Suite pytest
+├── README.md             # Documentation
+└── venv/                 # Environnement virtuel (après installation)
 ```
+
+## Tests
+
+Le projet dispose d'une suite pytest qui couvre la configuration, le système de logs, et la logique de synchronisation (copie, archivage, détection de débranchement, non-récursion sur `_Archive/`).
+
+```bash
+# Une seule fois : installer les dépendances de dev
+pip install -r requirements-dev.txt
+
+# Lancer la suite
+pytest -v
+```
+
+Les tests stub `tkinter` et `watchdog` au niveau import : aucun environnement graphique n'est requis. Les loggers sont isolés par test (chaque test reçoit son propre dossier `log/` temporaire).
+
+La CI GitHub (`.github/workflows/test.yml`) exécute automatiquement les tests à chaque push sur `main` et chaque pull request.
 
 ## Dépendances
 
-- **watchdog** : Bibliothèque de surveillance du système de fichiers
+**Runtime** :
+
+- **watchdog** : surveillance du système de fichiers
+- **pystray** + **Pillow** : zone de notification (system tray)
+
+**Développement** :
+
+- **pytest** : suite de tests
