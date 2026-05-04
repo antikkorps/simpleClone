@@ -156,6 +156,9 @@ Le fichier `log/activity/activity.log` enregistre **chaque opération réussie**
 
 | `op`              | Quand                                                                |
 | ----------------- | -------------------------------------------------------------------- |
+| `app_start`       | Démarrage de l'application                                           |
+| `heartbeat`       | Toutes les 15 minutes — preuve que l'app tourne (avec `state`, `uptime_s`) |
+| `app_stop`        | Fermeture propre de l'application (avec `uptime_s`)                  |
 | `copy`            | Fichier nouveau ou modifié détecté en surveillance                   |
 | `copy_initial`    | Fichier copié pendant la synchronisation initiale                    |
 | `archive`         | Fichier supprimé de la source → déplacé dans `_Archive/`            |
@@ -173,7 +176,87 @@ grep autoclave_001 log/activity/activity.log*
 
 # Avec jq, toutes les copies d'une journée
 cat log/activity/activity.log.2026-05-03 | jq 'select(.op | startswith("copy"))'
+
+# Dernier heartbeat (pour vérifier que l'app tourne)
+grep heartbeat log/activity/activity.log | tail -1
 ```
+
+## Mise en production
+
+Cette section s'adresse à l'administrateur qui déploie SimpleClone sur un poste client en exploitation continue. Les recommandations ci-dessous sont issues du retour d'expérience terrain et conditionnent la valeur probante du log d'audit.
+
+### 1. Sauvegarder le dossier `log/`
+
+Le log d'activité a une rétention de 6 ans. Si le disque qui le contient lâche, **l'audit disparaît avec lui**. Pour un usage légal :
+
+- Mettre `log/` sur un volume **régulièrement sauvegardé** (NAS, cloud, sauvegarde système Windows).
+- Idéalement, copier `log/activity/*.log*` sur un autre support une fois par mois (les anciens fichiers ne changent plus, c'est trivial à automatiser).
+- Si l'exe est dans `Program Files` (cas où SimpleClone bascule sur `%APPDATA%\SimpleClone\log\`), s'assurer que `%APPDATA%` du compte qui exécute l'app est bien dans le périmètre de sauvegarde.
+
+Le chemin effectif est affiché dans le journal d'activité de l'application au démarrage — si vous avez un doute, ouvrez la fenêtre.
+
+### 2. Vérifier que l'application tourne
+
+Toutes les **15 minutes**, SimpleClone écrit une ligne `heartbeat` dans `log/activity/activity.log`. C'est la preuve positive qu'à cet instant le process était vivant.
+
+**Vérification ponctuelle :**
+
+```bash
+# La dernière heartbeat doit dater de moins de 30 minutes
+grep heartbeat log/activity/activity.log | tail -1
+```
+
+**Surveillance automatisée (recommandée) :** un script planifié (Tâches planifiées Windows, cron sur un poste tiers, supervision Centreon/Zabbix...) qui alerte si la dernière heartbeat date de plus d'une heure. Exemple en PowerShell :
+
+```powershell
+$last = Get-Content "C:\path\to\log\activity\activity.log" | Select-String heartbeat | Select-Object -Last 1
+if (-not $last) { exit 1 }
+$ts = ($last -match '"ts": "([^"]+)"') ; $datetime = [datetime]$matches[1]
+if ((Get-Date) - $datetime -gt [TimeSpan]"01:00:00") { Write-Error "SimpleClone silencieux depuis > 1h" ; exit 1 }
+```
+
+### 3. Si l'opérateur signale un problème
+
+L'utilisateur peut **générer un fichier de diagnostic** depuis l'application : clic sur le **bouton `?`** en haut à droite de la fenêtre, puis **"Créer un fichier de diagnostic"**. SimpleClone écrit alors un fichier `simpleclone-diagnostic-DATE-HEURE.txt` dans `log/diagnostic/`, et ouvre l'Explorateur de fichiers Windows directement sur ce fichier.
+
+Le fichier contient :
+- l'état courant (surveillance en cours / en pause / arrêtée)
+- les chemins source et destination
+- la version de SimpleClone, Python, plateforme
+- la configuration JSON
+- les **200 dernières lignes** du journal d'activité
+- les **100 dernières lignes** du journal d'erreurs
+
+L'opérateur copie le fichier sur une clé USB et l'envoie au support technique. Tout le contexte nécessaire est dedans, pas besoin que l'utilisateur sache lire un log.
+
+### 4. En cas d'incident depuis le poste support
+
+**"Le fichier X est manquant en destination."**
+
+```bash
+# Le fichier a-t-il été copié ?
+grep "X" log/activity/activity.log*
+
+# Si oui : le log donne l'horodatage exact, le chemin source et destination, la taille
+# Si non : il n'a jamais été détecté côté source — vérifier la source
+```
+
+**"L'app était-elle bien active à la date Y ?"**
+
+```bash
+# Recherche la dernière heartbeat avant la date suspecte
+grep heartbeat log/activity/activity.log.2026-04-* | tail
+```
+
+Une séquence `app_start` ... `heartbeat` ... `heartbeat` ... `app_stop` est le signe d'un cycle propre. Une absence de `app_stop` après la dernière `heartbeat` indique une **terminaison anormale** (crash, kill, coupure secteur) — informatif pour l'enquête.
+
+### 5. Limitations connues à communiquer au client
+
+- **Modifications directes sur la destination** : si l'utilisateur modifie un fichier directement sur la clé USB, il sera **écrasé** au prochain événement source. La destination est un miroir de la source, pas un dossier de travail.
+- **Suppressions sur la source** : un fichier supprimé de la source est **archivé** dans `_Archive/` (jamais effacé définitivement par SimpleClone). Pour libérer de l'espace, c'est à l'utilisateur de purger manuellement `_Archive/`.
+- **Démarrage automatique Windows** : la commande enregistrée dans le registre contient le **chemin absolu** de l'exécutable. Si vous déplacez l'exe, il faut décocher puis recocher "Démarrer avec Windows" pour mettre à jour le registre.
+- **Intégrité des copies** : SimpleClone fait confiance à `shutil.copy2` (qui appelle l'API Windows native). Aucun checksum n'est calculé. Pour la majorité des cas c'est suffisant ; si votre cadre légal exige une preuve cryptographique d'intégrité, un complément (ex: hash sha256 stocké séparément) est nécessaire.
+- **Pas de sync bidirectionnelle** : si la destination doit être préservée contre l'écrasement, n'utilisez pas SimpleClone.
 
 ## Gestion des erreurs
 
