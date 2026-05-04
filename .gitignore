@@ -2,3 +2,12 @@ venv/
 __pycache__/
 *.pyc
 .env
+
+# Logs runtime générés par l'app (audit + errors)
+log/
+SimpleClone_Errors.log
+
+# PyInstaller (build local)
+build/
+dist/
+*.spec
