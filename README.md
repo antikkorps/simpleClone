@@ -121,17 +121,68 @@ pyinstaller --onefile --windowed --name "SimpleClone" --icon=monicon.ico SimpleC
 
 ## Fichiers générés
 
-| Fichier                  | Description                                                               |
-| ------------------------ | ------------------------------------------------------------------------- |
-| `SimpleClone_Errors.log` | Journal des erreurs (fichiers non copiés)                                 |
-| `_Archive/`              | Dossier dans la destination contenant les fichiers supprimés de la source |
+```
+log/
+├── activity/
+│   ├── activity.log                  ← fichier courant (jour J)
+│   ├── activity.log.2026-05-03       ← rotation à minuit
+│   ├── activity.log.2026-05-02
+│   └── ...                           ← conservés 6 ans (≈2190 fichiers)
+└── errors/
+    ├── SimpleClone_Errors.log        ← rotation par taille (5 Mo × 3)
+    ├── SimpleClone_Errors.log.1
+    └── ...
+```
+
+Le dossier `log/` est créé **à côté de l'exécutable** par défaut. Si l'exe est installé dans un emplacement non inscriptible (typiquement `Program Files`), il bascule automatiquement sur `%APPDATA%\SimpleClone\log\`. Le chemin effectif est affiché dans le journal de l'application au démarrage.
+
+À côté de la destination on trouve aussi :
+
+| Fichier     | Description                                                  |
+| ----------- | ------------------------------------------------------------ |
+| `_Archive/` | Fichiers et dossiers supprimés de la source (avec horodatage) |
+
+## Audit (preuve de copie)
+
+Le fichier `log/activity/activity.log` enregistre **chaque opération réussie** au format JSON-lines (une ligne par événement) :
+
+```json
+{"ts": "2026-05-04T11:42:04", "op": "copy_initial", "src": "C:/data/autoclave_001.csv", "dest": "E:/backup/autoclave_001.csv", "size": 18432}
+{"ts": "2026-05-04T11:42:09", "op": "copy", "src": "C:/data/cycle_42.txt", "dest": "E:/backup/cycle_42.txt", "size": 24500}
+{"ts": "2026-05-04T11:43:11", "op": "archive", "src": "C:/data/old.csv", "dest": "E:/backup/_Archive/old_20260504_114311.csv", "size": 12000}
+```
+
+**Opérations tracées :**
+
+| `op`              | Quand                                                                |
+| ----------------- | -------------------------------------------------------------------- |
+| `copy`            | Fichier nouveau ou modifié détecté en surveillance                   |
+| `copy_initial`    | Fichier copié pendant la synchronisation initiale                    |
+| `archive`         | Fichier supprimé de la source → déplacé dans `_Archive/`            |
+| `archive_dir`     | Dossier supprimé de la source                                        |
+| `archive_orphan`  | Fichier orphelin déplacé après une reprise de pause USB              |
+| `rename`          | Fichier ou dossier renommé/déplacé                                   |
+
+**Rétention :** rotation quotidienne à minuit, **conservation 6 ans** (politique adaptée à un cycle d'archivage légal de 5 ans + marge). Les fichiers plus anciens sont supprimés automatiquement.
+
+**Exploitation :** le format JSON-lines permet d'extraire facilement les preuves :
+
+```bash
+# Toutes les copies d'un fichier précis
+grep autoclave_001 log/activity/activity.log*
+
+# Avec jq, toutes les copies d'une journée
+cat log/activity/activity.log.2026-05-03 | jq 'select(.op | startswith("copy"))'
+```
 
 ## Gestion des erreurs
 
 Le script ne crash jamais. Si un fichier ne peut pas être copié (verrouillé, permissions, chemin trop long), il est :
 
-- Enregistré dans `SimpleClone_Errors.log`
+- Enregistré dans `log/errors/SimpleClone_Errors.log`
 - Ignoré, le script continue avec le fichier suivant
+
+Le log d'erreurs utilise une rotation **par taille** (5 Mo × 3 fichiers maximum), distincte du log d'activité — les erreurs sont du debug technique, pas un audit légal.
 
 ## Structure du projet
 
