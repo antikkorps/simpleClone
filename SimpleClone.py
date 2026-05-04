@@ -40,9 +40,24 @@ except ImportError:
 # =============================================================================
 
 ARCHIVE_FOLDER_NAME = "_Archive"  # Dossier où sont déplacés les fichiers supprimés
-LOG_FILE_NAME = "SimpleClone_Errors.log"
-LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 Mo par fichier de log avant rotation
-LOG_BACKUP_COUNT = 3              # Nombre d'anciennes versions conservées
+
+# Structure des logs (à côté de l'exe ou dans %APPDATA% en fallback) :
+#   log/
+#   ├── errors/   → SimpleClone_Errors.log (rotation par taille)
+#   └── activity/ → activity.log + activity.log.YYYY-MM-DD (rotation quotidienne, 6 ans)
+LOG_DIR_NAME = "log"
+ERRORS_DIR_NAME = "errors"
+ACTIVITY_DIR_NAME = "activity"
+ERRORS_LOG_FILE_NAME = "SimpleClone_Errors.log"
+ACTIVITY_LOG_FILE_NAME = "activity.log"
+
+# Rétention du log d'activité : politique client = 5 ans pour les graphiques
+# d'autoclaves, on garde 6 ans de logs pour avoir une marge de sécurité.
+ACTIVITY_LOG_RETENTION_DAYS = 2190  # 6 × 365
+
+LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 Mo par fichier de log d'erreurs avant rotation
+LOG_BACKUP_COUNT = 3              # Nombre d'anciennes versions d'erreurs conservées
+
 DEFAULT_POLLING_INTERVAL = 2  # Intervalle de vérification en secondes (polling)
 DEST_RETRY_INTERVAL = 5  # Délai entre deux tentatives de reconnexion de la destination
 MAX_LOG_LINES_UI = 1000  # Limite de lignes dans le journal de l'UI (évite la fuite mémoire en H24)
@@ -68,28 +83,71 @@ def _make_tray_icon_image(color_hex):
 
 
 # =============================================================================
-# LOGGER D'ERREURS (rotation automatique des fichiers .log)
+# LOGGERS (erreurs avec rotation par taille + audit d'activité avec rotation quotidienne)
 # =============================================================================
 
-def _get_log_path():
-    """Chemin du fichier de log : à côté de l'exe en mode frozen, sinon du script."""
-    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
-    return base / LOG_FILE_NAME
+# Cache du dossier log/ résolu (évite de retester l'écriture à chaque appel)
+_resolved_log_dir = None
+
+
+def _resolve_log_dir():
+    """
+    Détermine le dossier `log/` à utiliser. Stratégie :
+    1. À côté de l'exe (ou du script) — discoverable, reste avec l'app
+    2. Fallback %APPDATA%\\SimpleClone\\log si pas de droits écriture (typique
+       quand l'exe est dans Program Files)
+    3. Fallback ~/.config/SimpleClone/log (Linux/dev)
+    On teste réellement l'écriture car mkdir réussit parfois là où la
+    création de fichier échoue (ACL Windows tordues).
+    """
+    global _resolved_log_dir
+    if _resolved_log_dir is not None:
+        return _resolved_log_dir
+
+    candidates = []
+    exe_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+    candidates.append(exe_dir / LOG_DIR_NAME)
+
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "SimpleClone" / LOG_DIR_NAME)
+    else:
+        candidates.append(Path.home() / ".config" / "SimpleClone" / LOG_DIR_NAME)
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write_test"
+            probe.touch()
+            probe.unlink()
+            _resolved_log_dir = candidate
+            return _resolved_log_dir
+        except Exception:
+            continue
+
+    # Dernier recours : tmp (les logs ne survivront pas au reboot mais l'app tourne)
+    import tempfile
+    _resolved_log_dir = Path(tempfile.gettempdir()) / "SimpleClone-log"
+    _resolved_log_dir.mkdir(parents=True, exist_ok=True)
+    return _resolved_log_dir
 
 
 def _setup_error_logger():
     """
-    Configure un logger avec rotation automatique : SimpleClone_Errors.log,
-    .log.1, .log.2, .log.3 max. Ça évite que le fichier grossisse sans limite
-    quand l'app tourne H24 sur le site client.
+    Logger d'erreurs : rotation par TAILLE (5 Mo × 3) — ce log est pour le
+    debug technique, pas pour l'audit. On veut éviter qu'il grossisse sans
+    limite, peu importe la rétention.
     """
-    logger = logging.getLogger("simpleclone")
+    logger = logging.getLogger("simpleclone.errors")
     logger.setLevel(logging.ERROR)
-    # Idempotent : ne pas ré-attacher de handlers si déjà configuré
+    logger.propagate = False
     if not logger.handlers:
         try:
+            errors_dir = _resolve_log_dir() / ERRORS_DIR_NAME
+            errors_dir.mkdir(parents=True, exist_ok=True)
             handler = logging.handlers.RotatingFileHandler(
-                _get_log_path(),
+                errors_dir / ERRORS_LOG_FILE_NAME,
                 maxBytes=LOG_MAX_BYTES,
                 backupCount=LOG_BACKUP_COUNT,
                 encoding="utf-8",
@@ -99,13 +157,67 @@ def _setup_error_logger():
             ))
             logger.addHandler(handler)
         except Exception:
-            # Échec d'init du fichier de log : on ajoute un handler "null" pour
-            # que les .error() ne crashent pas. L'app continue sans log fichier.
+            logger.addHandler(logging.NullHandler())
+    return logger
+
+
+def _setup_activity_logger():
+    """
+    Logger d'activité (audit légal) : rotation quotidienne via
+    TimedRotatingFileHandler. Le fichier courant est `activity.log` ;
+    après rotation à minuit il devient `activity.log.YYYY-MM-DD`.
+    Conservation : ACTIVITY_LOG_RETENTION_DAYS jours, le handler supprime
+    automatiquement les fichiers plus anciens.
+    """
+    logger = logging.getLogger("simpleclone.activity")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        try:
+            activity_dir = _resolve_log_dir() / ACTIVITY_DIR_NAME
+            activity_dir.mkdir(parents=True, exist_ok=True)
+            handler = logging.handlers.TimedRotatingFileHandler(
+                activity_dir / ACTIVITY_LOG_FILE_NAME,
+                when="midnight",
+                interval=1,
+                backupCount=ACTIVITY_LOG_RETENTION_DAYS,
+                encoding="utf-8",
+                utc=False,
+            )
+            # Pas de préfixe ajouté par le logger : chaque ligne est déjà du JSON
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            logger.addHandler(handler)
+        except Exception:
             logger.addHandler(logging.NullHandler())
     return logger
 
 
 _error_logger = _setup_error_logger()
+_activity_logger = _setup_activity_logger()
+
+
+def log_activity(operation, src=None, dest=None, size_bytes=None, **extra):
+    """
+    Écrit une ligne JSON dans le log d'activité (audit).
+    Format : {"ts": ISO, "op": str, "src": str, "dest": str, "size": int, ...}
+    Ne lève jamais d'exception — un échec de log ne doit pas interrompre la sync.
+    """
+    entry = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "op": operation,
+    }
+    if src is not None:
+        entry["src"] = str(src)
+    if dest is not None:
+        entry["dest"] = str(dest)
+    if size_bytes is not None:
+        entry["size"] = size_bytes
+    if extra:
+        entry.update(extra)
+    try:
+        _activity_logger.info(json.dumps(entry, ensure_ascii=False))
+    except Exception:
+        pass  # Logger ou JSON cassé : on ignore, jamais bloquer la sync
 
 
 # =============================================================================
@@ -339,6 +451,12 @@ class SyncHandler(FileSystemEventHandler):
             # Crée le dossier parent si nécessaire
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_path, dest_path)
+            # Audit log : prouve que la copie a eu lieu (pour graphiques d'autoclaves)
+            try:
+                size = dest_path.stat().st_size
+            except OSError:
+                size = None
+            log_activity("copy", src=src_path, dest=dest_path, size_bytes=size)
             self._log_success("Copié", src_path)
             return True
         except Exception as e:
@@ -354,9 +472,15 @@ class SyncHandler(FileSystemEventHandler):
         try:
             dest_file = self._get_dest_path(src_path)
             if dest_file.exists():
+                # Capture la taille avant le move (le fichier source disparaît après)
+                try:
+                    size = dest_file.stat().st_size
+                except OSError:
+                    size = None
                 archive_file = self._get_archive_path(src_path)
                 archive_file.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(dest_file), str(archive_file))
+                log_activity("archive", src=src_path, dest=archive_file, size_bytes=size)
                 self._log_success("Archivé", src_path)
                 return True
         except Exception as e:
@@ -383,6 +507,7 @@ class SyncHandler(FileSystemEventHandler):
                 archive_path = self._get_archive_path(src_path)
                 archive_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(dest_path), str(archive_path))
+                log_activity("archive_dir", src=src_path, dest=archive_path)
                 self._log_success("Dossier archivé", src_path)
             return True
         except Exception as e:
@@ -431,6 +556,7 @@ class SyncHandler(FileSystemEventHandler):
             if old_dest.exists():
                 new_dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(old_dest), str(new_dest))
+                log_activity("rename", src=event.src_path, dest=event.dest_path)
                 self._log_success("Déplacé/Renommé", event.dest_path)
         except Exception as e:
             self._log_error("DÉPLACEMENT", event.src_path, e)
@@ -499,6 +625,13 @@ def initial_sync(source_path, dest_path, handler, progress_callback, log_callbac
                 if should_copy:
                     dest_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src_file, dest_file)
+                    # Audit : on distingue copy_initial (sync de démarrage)
+                    # de copy (event watchdog) pour pouvoir filtrer plus tard
+                    try:
+                        size = dest_file.stat().st_size
+                    except OSError:
+                        size = None
+                    log_activity("copy_initial", src=src_file, dest=dest_file, size_bytes=size)
                     log_callback(f"✓ Copié: {file_name}", "success")
 
                 copied_files += 1
@@ -539,11 +672,16 @@ def initial_sync(source_path, dest_path, handler, progress_callback, log_callbac
                     src_equiv = source / rel_path
                     if not src_equiv.exists():
                         # Fichier orphelin : archive (pas suppression)
+                        try:
+                            size = dest_file.stat().st_size
+                        except OSError:
+                            size = None
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         archive_name = f"{rel_path.stem}_{timestamp}{rel_path.suffix}"
                         archive_target = dest / ARCHIVE_FOLDER_NAME / rel_path.parent / archive_name
                         archive_target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(dest_file), str(archive_target))
+                        log_activity("archive_orphan", src=dest_file, dest=archive_target, size_bytes=size)
                         orphans_archived += 1
                         log_callback(f"📦 Orphelin archivé: {file_name}", "info")
                 except Exception as e:
@@ -605,6 +743,13 @@ class SimpleCloneApp:
 
         # Gestion de la fermeture
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # Affiche le chemin du dossier de logs au démarrage : pratique pour
+        # l'admin si l'app est tombée sur le fallback %APPDATA%.
+        try:
+            self._log(f"📁 Logs : {_resolve_log_dir()}", "info")
+        except Exception:
+            pass
 
         # Initialisation de l'icône dans la zone de notification (Windows uniquement).
         # Si pystray n'est pas dispo, l'app continue sans tray (clic sur X = quitter).
@@ -689,14 +834,14 @@ class SimpleCloneApp:
         self.cb_autostart_surveillance.pack(side=tk.LEFT)
 
         # === BOUTON PRINCIPAL ===
+        # bg piloté par _set_state (vert au repos, orange quand actif/en pause)
         self.start_button = tk.Button(
             main_frame,
             text="▶ DÉMARRER LA SURVEILLANCE",
             command=self._toggle_surveillance,
             font=("Segoe UI", 12, "bold"),
-            bg="#4CAF50",
+            bg=COLOR_RUNNING,
             fg="white",
-            activebackground="#45a049",
             activeforeground="white",
             height=2,
             cursor="hand2"
@@ -827,19 +972,22 @@ class SimpleCloneApp:
         """
         Centralise les transitions d'état et l'UI associée.
         Doit être appelée depuis le main thread (utiliser root.after sinon).
+        Le bouton "Arrêter" est orange (et non rouge) : le rouge dramatisait
+        une action triviale (la surveillance se relance en un clic) et créait
+        un faux signal d'alerte alors que le statut indicateur est vert.
         """
         self.state = new_state
         if new_state == STATE_RUNNING:
-            self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg="#f44336")
+            self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg=COLOR_PAUSED)
             self.status_indicator.configure(fg=COLOR_RUNNING)
             self.warning_frame.pack(fill=tk.X, pady=(0, 5))
         elif new_state == STATE_PAUSED_USB:
-            self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg="#f44336")
+            self.start_button.configure(text="⏹ ARRÊTER LA SURVEILLANCE", bg=COLOR_PAUSED)
             self.status_indicator.configure(fg=COLOR_PAUSED)
             self.warning_frame.pack(fill=tk.X, pady=(0, 5))
             self.status_var.set("⏸ En pause — destination inaccessible")
         else:  # STATE_STOPPED
-            self.start_button.configure(text="▶ DÉMARRER LA SURVEILLANCE", bg="#4CAF50")
+            self.start_button.configure(text="▶ DÉMARRER LA SURVEILLANCE", bg=COLOR_RUNNING)
             self.status_indicator.configure(fg="gray")
             self.warning_frame.pack_forget()
 
