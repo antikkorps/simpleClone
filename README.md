@@ -96,7 +96,9 @@ git tag v1.2.0
 git push --tags
 ```
 
-L'exécutable apparaît ensuite dans l'onglet **Releases** du dépôt GitHub. Pas besoin d'avoir Windows en local.
+Le build produit un **dossier `SimpleClone/`** (mode `--onedir`) packagé en `SimpleClone-<version>-windows.zip` et publié dans l'onglet **Releases** avec son empreinte SHA256.
+
+> **Pourquoi `--onedir` et pas `--onefile` ?** Les exécutables `--onefile` PyInstaller embarquent un mini-extracteur qui décompresse l'app dans un dossier temporaire à chaque lancement — comportement très similaire à des techniques de packing utilisées par les malwares, ce qui déclenche fréquemment **Windows Defender** (faux positifs, fichier supprimé silencieusement de la clé USB, etc.). Le mode `--onedir` produit un dossier transparent : un `.exe` standard accompagné de ses DLLs. Démarrage plus rapide, beaucoup moins de faux positifs antivirus.
 
 ### Option 2 : manuel sur Windows
 
@@ -107,17 +109,67 @@ venv\Scripts\activate
 # 2. Installer PyInstaller
 pip install pyinstaller
 
-# 3. Créer l'exécutable
-pyinstaller --onefile --windowed --name "SimpleClone" SimpleClone.py
+# 3. Créer l'exécutable (dossier complet)
+pyinstaller --onedir --windowed --name "SimpleClone" SimpleClone.py
 ```
 
-L'exécutable sera créé dans le dossier `dist/SimpleClone.exe`.
+Le résultat est dans `dist/SimpleClone/` — il faut **distribuer le dossier entier**, pas seulement `SimpleClone.exe`.
 
 ### Avec une icône personnalisée
 
 ```bash
-pyinstaller --onefile --windowed --name "SimpleClone" --icon=monicon.ico SimpleClone.py
+pyinstaller --onedir --windowed --name "SimpleClone" --icon=monicon.ico SimpleClone.py
 ```
+
+## Le `.exe` est bloqué par Windows ?
+
+Les binaires Python empaquetés (PyInstaller) **ne sont pas signés** et déclenchent régulièrement des faux positifs avec Windows Defender et SmartScreen. Symptômes typiques :
+
+- Au téléchargement : "Ce fichier n'est pas couramment téléchargé" (SmartScreen).
+- À la copie sur clé USB : "Vous avez besoin des droits administrateur pour copier ce fichier".
+- Pire : **l'exe disparaît tout seul** d'une clé USB quelques minutes après la copie (mis en quarantaine par Defender).
+
+### Vérifier d'abord que le fichier n'a pas été altéré
+
+Le hash SHA256 publié sur la Release sert exactement à ça :
+
+```powershell
+# Dans le dossier du téléchargement
+Get-FileHash .\SimpleClone-0.11.1-windows.zip -Algorithm SHA256
+```
+
+La valeur affichée doit être identique à celle du fichier `.sha256` publié à côté du zip. Si elle diffère, **ne pas utiliser le fichier** : il a été modifié (ou un antivirus en a tronqué une partie).
+
+### Débloquer le fichier (Mark of the Web)
+
+Tout fichier téléchargé depuis Internet reçoit une marque "zone Internet" qui durcit les restrictions. Sur le **zip**, avant extraction :
+
+1. Clic droit sur `SimpleClone-x.y.z-windows.zip` → **Propriétés**
+2. En bas de l'onglet **Général**, cocher **"Débloquer"** → **Appliquer**
+3. Extraire ensuite (la marque ne se propage pas aux fichiers extraits)
+
+### Récupérer un fichier mis en quarantaine
+
+Si l'exe a disparu après copie sur clé USB :
+
+1. Ouvrir **Sécurité Windows** → **Protection contre les virus et menaces**
+2. Cliquer sur **Historique de protection**
+3. Repérer la ligne `SimpleClone.exe` → **Actions** → **Restaurer**
+
+Pour éviter que ça recommence, ajouter une exclusion (voir ci-dessous).
+
+### Ajouter une exclusion Windows Defender
+
+Si vous savez ce que vous faites et avez vérifié le hash SHA256 :
+
+1. **Sécurité Windows** → **Protection contre les virus et menaces** → **Gérer les paramètres** (sous "Paramètres de protection contre les virus et menaces")
+2. Tout en bas : **Ajouter ou supprimer des exclusions**
+3. Ajouter une exclusion de type **Dossier** pointant vers le dossier d'installation de SimpleClone (ex : `C:\Program Files\SimpleClone\`)
+4. Ajouter aussi le lecteur de la clé USB cible si Defender bloque la copie
+
+### Si rien ne fonctionne
+
+Signaler le faux positif à Microsoft : https://www.microsoft.com/en-us/wdsi/filesubmission — cocher "I believe this file should not be detected as malware". Une fois traité (généralement quelques jours), la signature problématique est retirée pour tous les utilisateurs.
 
 ## Fichiers générés
 

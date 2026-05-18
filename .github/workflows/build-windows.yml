@@ -4,10 +4,10 @@ on:
   push:
     tags:
       - "v*.*.*"
-  workflow_dispatch:  # Permet aussi un build manuel depuis l'onglet Actions
+  workflow_dispatch: # Allows manual build from the Actions tab
 
 permissions:
-  contents: write  # Requis par softprops/action-gh-release pour créer/éditer les Releases
+  contents: write # Required by softprops/action-gh-release to create/edit Releases
 
 jobs:
   build:
@@ -29,19 +29,117 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build executable
-        run: pyinstaller --onefile --windowed --name SimpleClone SimpleClone.py
+      - name: Extract version from simpleclone_core.py
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep -oP 'APP_VERSION = "\K[^"]+' simpleclone_core.py)
+          if [ -z "$VERSION" ]; then
+            echo "Could not extract APP_VERSION" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Extracted version: $VERSION"
+
+      - name: Generate version_info.txt (Windows resource metadata)
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          IFS='.' read -ra PARTS <<< "$VERSION"
+          MAJOR=${PARTS[0]:-0}
+          MINOR=${PARTS[1]:-0}
+          PATCH=${PARTS[2]:-0}
+          BUILD=${PARTS[3]:-0}
+          TUPLE="${MAJOR}, ${MINOR}, ${PATCH}, ${BUILD}"
+          cat > version_info.txt <<EOF
+          VSVersionInfo(
+            ffi=FixedFileInfo(
+              filevers=(${TUPLE}),
+              prodvers=(${TUPLE}),
+              mask=0x3f,
+              flags=0x0,
+              OS=0x40004,
+              fileType=0x1,
+              subtype=0x0,
+              date=(0, 0)
+            ),
+            kids=[
+              StringFileInfo([
+                StringTable(
+                  '040904B0',
+                  [
+                    StringStruct('CompanyName', 'SimpleClone'),
+                    StringStruct('FileDescription', 'SimpleClone - One-way folder sync utility'),
+                    StringStruct('FileVersion', '${VERSION}'),
+                    StringStruct('InternalName', 'SimpleClone'),
+                    StringStruct('LegalCopyright', 'MIT License'),
+                    StringStruct('OriginalFilename', 'SimpleClone.exe'),
+                    StringStruct('ProductName', 'SimpleClone'),
+                    StringStruct('ProductVersion', '${VERSION}')
+                  ]
+                )
+              ]),
+              VarFileInfo([VarStruct('Translation', [1033, 1200])])
+            ]
+          )
+          EOF
+          echo "--- version_info.txt ---"
+          cat version_info.txt
+
+      - name: Build executable (onedir reduces antivirus false positives)
+        run: pyinstaller --onedir --windowed --name SimpleClone --version-file version_info.txt SimpleClone.py
+
+      - name: Package as zip
+        id: package
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ZIP_NAME="SimpleClone-${VERSION}-windows.zip"
+          cd dist
+          7z a -tzip "../${ZIP_NAME}" SimpleClone
+          cd ..
+          echo "zip_name=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
+          ls -la "${ZIP_NAME}"
+
+      - name: Compute SHA256 checksum
+        id: checksum
+        shell: bash
+        run: |
+          ZIP_NAME="${{ steps.package.outputs.zip_name }}"
+          HASH_FILE="${ZIP_NAME}.sha256"
+          HASH=$(sha256sum "${ZIP_NAME}" | awk '{print $1}')
+          echo "${HASH}  ${ZIP_NAME}" > "${HASH_FILE}"
+          echo "hash_file=${HASH_FILE}" >> "$GITHUB_OUTPUT"
+          echo "SHA256: ${HASH}"
+          cat "${HASH_FILE}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: SimpleClone-${{ github.ref_name }}
-          path: dist/SimpleClone.exe
+          path: |
+            ${{ steps.package.outputs.zip_name }}
+            ${{ steps.checksum.outputs.hash_file }}
           if-no-files-found: error
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/SimpleClone.exe
+          files: |
+            ${{ steps.package.outputs.zip_name }}
+            ${{ steps.checksum.outputs.hash_file }}
           generate_release_notes: true
+          body: |
+            ## Installation
+
+            1. Download `${{ steps.package.outputs.zip_name }}` below.
+            2. **Right-click the zip → Properties → check "Unblock" → Apply** (removes the Mark of the Web).
+            3. Extract anywhere (e.g. `C:\Program Files\SimpleClone\` or a folder of your choice).
+            4. Launch `SimpleClone\SimpleClone.exe`.
+
+            ## Windows Defender flagging the executable?
+
+            PyInstaller binaries sometimes trigger antivirus false positives.
+            Verify the integrity with the published SHA256 (`${{ steps.package.outputs.zip_name }}.sha256`)
+            and see the README section **"Le `.exe` est bloqué par Windows ?"** for unblocking steps.
